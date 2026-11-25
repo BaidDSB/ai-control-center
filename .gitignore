@@ -1,0 +1,10 @@
+/target/
+/dist/
+control_center_config*.toml
+llama_swap_config.yaml
+help.md
+*.log
+.DS_Store
+Thumbs.db
+llama-swap.yaml
+models.ini

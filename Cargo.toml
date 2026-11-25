@@ -1,0 +1,26 @@
+[package]
+name = "ai-control-center"
+version = "1.0.0"
+edition = "2024"
+description = "Cross-platform multi-engine local LLM launcher and llama-swap router GUI"
+license = "MIT"
+repository = "https://github.com/BaidDSB/ai-control-center"
+
+[features]
+default = []
+plus = []
+
+[lib]
+name = "ai_control_center"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ai-control-center"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.37.0", features = ["glow", "clipboard"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+rfd = "0.17"
+image = "0.25"
