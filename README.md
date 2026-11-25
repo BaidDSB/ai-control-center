@@ -5,14 +5,16 @@ A fast, native desktop control panel for running local Large Language Models (LL
 ## Screenshots
 
 ### Core Edition
-| | |
-| :---: | :---: |
-| ![Core 1](screenshots/core-1.png) | ![Core 2](screenshots/core-2.png) |
+
+![Core 1](screenshots/core-1.png)
+
+![Core 2](screenshots/core-2.png)
 
 ### Plus Edition
-| | |
-| :---: | :---: |
-| ![Plus 1](screenshots/plus-1.png) | ![Plus 2](screenshots/plus-2.png) |
+
+![Plus 1](screenshots/plus-1.png)
+
+![Plus 2](screenshots/plus-2.png)
 
 ### Example: Fully Configured Plus Setup
 *What Plus can look like in daily use once you add your own models, engines, companion services, scripts, and notes:*
