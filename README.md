@@ -21,10 +21,10 @@ A fast, native desktop control panel for running local Large Language Models (LL
 
 ![Fully Configured Plus Setup](screenshots/personal.png)
 
-### Multi-Engine Hot-Swapping in Action
-*A single `llama-swap` Routing Set switching seamlessly between models across different backends (`llama.cpp` running Qwen 4B & 9B, and a separate custom Rust 4B engine) inside the same chat session:*
+### Proof: Live Model & Cross-Engine Hot-Swapping (Single Chat Session)
+*One continuous chat showing **Qwen 4B** → **Qwen 9B** (hot-swapping models inside `llama.cpp`) → **4B model on `rustingstrata`** (switching both the inference engine and the loaded model on the fly through a single Routing Set):*
 
-![Multi-Engine Hot-Swapping Proof](screenshots/proof.png)
+![Live multi-engine and model hot-swapping proof](screenshots/proof.png)
 
 ## Highlights
 
