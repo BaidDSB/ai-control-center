@@ -3,7 +3,8 @@ name = "ai-control-center"
 version = "1.0.0"
 edition = "2024"
 description = "Cross-platform multi-engine local LLM launcher and llama-swap router GUI"
-license = "MIT"
+license-file = "LICENSE"
+publish = false
 repository = "https://github.com/BaidDSB/ai-control-center"
 
 [features]

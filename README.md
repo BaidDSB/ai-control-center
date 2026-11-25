@@ -60,6 +60,8 @@ AI Control Center is available in two free editions—clearly labeled as **`AI C
 - **Core:** Focused, minimal control panel for managing LLM engines, Routing Sets, and a web frontend.
 - **Plus:** Everything in Core, plus integrated controls for sidecar services, custom terminal scripts, `mcpo`, and per-model Markdown notes.
 
+> **Design Scope:** **Core** is the focused inference launcher (engines, `llama-swap` / `models.ini` routing, live diffing, and consoles). **Plus** is an optional workstation convenience layer gated behind a compile-time feature flag (`--features plus`)—its extra controls stay completely hidden unless configured.
+
 ## Quick Start (Windows & Linux)
 
 ### 1. Download & Extract
@@ -301,4 +303,4 @@ Global notes displayed for any profile using llama.cpp.
 
 ## License
 
-Freeware — **All Rights Reserved**. Compiled binaries are free for personal and non-commercial use. See [LICENSE](LICENSE) for full terms.
+Source-Available Freeware — **All Rights Reserved**. The source code is published for transparency and security inspection. You may use the compiled binaries or build from source for personal, non-commercial use. See [LICENSE](LICENSE) for full terms.
