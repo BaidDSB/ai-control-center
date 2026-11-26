@@ -1,8 +1,8 @@
 use crate::{config, platform, runtime, AppPatch};
 
 use config::{
-    build_diff_layout_job, guess_help_key, parse_help_markdown, parse_help_markdown_str, probe_gguf_header,
-    scan_gguf_models, slugify, EnginePreset, GgufInfo, HelpMap, ModelGroup, ModelProfile,
+    compute_cli_diff, guess_help_key, parse_help_markdown, parse_help_markdown_str, probe_gguf_header,
+    scan_gguf_models, slugify, DiffKind, EnginePreset, GgufInfo, HelpMap, ModelGroup, ModelProfile,
     ModelSpec, RoutingSet, StackConfig, ThemeMode,
 };
 use eframe::egui;
@@ -10,7 +10,7 @@ use rfd::FileDialog;
 use runtime::{
     collect_backend_exes, launch_mcpo, launch_open_webui, launch_routing_set,
     launch_single_profile, poll_processes_full, run_bat_file, start_companion_service, stop_companion_service, stop_all_backends, stop_process,
-    ConsoleBuffer, ProcStatus, SharedConsole, SharedErrors,
+    ConsoleBuffer, ProcStatus, SharedConsole, SharedErrors, UiNotifier, UiNotifyTarget,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -182,6 +182,50 @@ fn llama_vp_id() -> egui::ViewportId {
 
 fn owu_vp_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("ai_cc_owu_console_vp")
+}
+
+fn console_notifier(ctx: egui::Context, vp_id: egui::ViewportId) -> UiNotifier {
+    Arc::new(move |target| match target {
+        UiNotifyTarget::Root => ctx.request_repaint_of(egui::ViewportId::ROOT),
+        UiNotifyTarget::Console => ctx.request_repaint_of(vp_id),
+        UiNotifyTarget::Both => {
+            ctx.request_repaint_of(vp_id);
+            ctx.request_repaint_of(egui::ViewportId::ROOT);
+        }
+    })
+}
+
+fn build_diff_layout_job(
+    current: &ModelProfile,
+    saved: &ModelProfile,
+    models_dir: &str,
+) -> (egui::text::LayoutJob, Vec<String>, usize) {
+    use egui::{Color32, FontId, TextFormat};
+    let diff = compute_cli_diff(current, saved, models_dir);
+    let mut job = egui::text::LayoutJob::default();
+
+    let white_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(230, 234, 244), ..Default::default() };
+    let green_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(52, 211, 153), ..Default::default() };
+    let amber_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(251, 191, 36), ..Default::default() };
+    let dim_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(130, 138, 155), ..Default::default() };
+
+    if let Some(kind) = diff.env_pinned {
+        let fmt = if kind == DiffKind::Added { green_fmt.clone() } else { amber_fmt.clone() };
+        job.append("[ENV: GGML_CUDA_NO_PINNED=1] ", 0.0, fmt);
+    }
+
+    job.append(&diff.exe_name, 0.0, dim_fmt);
+    for (tok, kind) in &diff.tokens {
+        job.append(" ", 0.0, white_fmt.clone());
+        let fmt = match kind {
+            DiffKind::Added => green_fmt.clone(),
+            DiffKind::Modified => amber_fmt.clone(),
+            DiffKind::Unchanged => white_fmt.clone(),
+        };
+        job.append(tok, 0.0, fmt);
+    }
+
+    (job, diff.removed, diff.change_count)
 }
 
 fn load_window_icon(icon_path: &str, embedded: Option<&[u8]>) -> Option<egui::IconData> {
@@ -1652,8 +1696,7 @@ let help_open = self.right_drawer == Some(RightDrawerTab::Help);
                                 &set,
                                 Arc::clone(&self.llama_console),
                                 Arc::clone(&self.error_logs),
-                                ui.ctx().clone(),
-                                llama_vp_id(),
+                                console_notifier(ui.ctx().clone(), llama_vp_id()),
                             ) {
                                 Ok(()) => {
                                     self.loaded_label = Some(format!("Routing Set: {} [{}]", set.name, set.mode));
@@ -1678,7 +1721,7 @@ let help_open = self.right_drawer == Some(RightDrawerTab::Help);
                             self.set_procs(procs);
                             self.status_msg = format!("Stopped {fe_name}.");
                         } else {
-                            match launch_open_webui(&self.cfg, Arc::clone(&self.owu_console), Arc::clone(&self.error_logs), ui.ctx().clone(), owu_vp_id()) {
+                            match launch_open_webui(&self.cfg, Arc::clone(&self.owu_console), Arc::clone(&self.error_logs), console_notifier(ui.ctx().clone(), owu_vp_id())) {
                                 Ok(()) => { procs.owu = true; self.set_procs(procs); self.status_msg = format!("Started {fe_name} on port {}.", self.cfg.owu_port); }
                                 Err(e) => self.push_error(e),
                             }
@@ -2810,8 +2853,7 @@ ui.add_space(4.0);
                                                     &set,
                                                     Arc::clone(&self.llama_console),
                                                     Arc::clone(&self.error_logs),
-                                                    ui.ctx().clone(),
-                                                    llama_vp_id(),
+                                                    console_notifier(ui.ctx().clone(), llama_vp_id()),
                                                 ) {
                                                     Ok(()) => {
                                                         self.loaded_label = Some(format!("Routing Set: {} [{}]", set.name, set.mode));
@@ -2845,8 +2887,7 @@ ui.add_space(4.0);
                                                     &prof,
                                                     Arc::clone(&self.llama_console),
                                                     Arc::clone(&self.error_logs),
-                                                    ui.ctx().clone(),
-                                                    llama_vp_id(),
+                                                    console_notifier(ui.ctx().clone(), llama_vp_id()),
                                                 ) {
                                                     Ok(()) => {
                                                         self.loaded_label = Some(format!("{gtitle} -> {} [{}]", prof.name, prof.engine_badge_name()));

@@ -1,4 +1,3 @@
-use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -244,7 +243,14 @@ pub struct EnginePreset {
 
 impl EnginePreset {
     pub fn default_exe_for_kind(_kind: &str) -> &'static str {
-        "llama-server.exe"
+        #[cfg(windows)]
+        {
+            "llama-server.exe"
+        }
+        #[cfg(not(windows))]
+        {
+            "llama-server"
+        }
     }
 }
 
@@ -1182,37 +1188,49 @@ fn parse_cli_pairs(tokens: &[String]) -> (Vec<(String, String)>, HashMap<String,
     (ordered, map)
 }
 
-pub fn build_diff_layout_job(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffKind {
+    Unchanged,
+    Added,
+    Modified,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CliDiff {
+    pub exe_name: String,
+    pub env_pinned: Option<DiffKind>,
+    pub tokens: Vec<(String, DiffKind)>,
+    pub removed: Vec<String>,
+    pub change_count: usize,
+}
+
+pub fn compute_cli_diff(
     current: &ModelProfile,
     saved: &ModelProfile,
     models_dir: &str,
-) -> (egui::text::LayoutJob, Vec<String>, usize) {
-    use egui::{Color32, FontId, TextFormat};
-    let mut job = egui::text::LayoutJob::default();
-    let mut removed_items = Vec::new();
+) -> CliDiff {
+    let mut removed = Vec::new();
     let mut change_count = 0usize;
 
-    let white_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(230, 234, 244), ..Default::default() };
-    let green_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(52, 211, 153), ..Default::default() };
-    let amber_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(251, 191, 36), ..Default::default() };
-    let dim_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(130, 138, 155), ..Default::default() };
-
-    if current.should_disable_cuda_pinned() {
-        let fmt = if !saved.should_disable_cuda_pinned() {
+    let env_pinned = if current.should_disable_cuda_pinned() {
+        if !saved.should_disable_cuda_pinned() {
             change_count += 1;
-            green_fmt.clone()
+            Some(DiffKind::Added)
         } else {
-            amber_fmt.clone()
-        };
-        job.append("[ENV: GGML_CUDA_NO_PINNED=1] ", 0.0, fmt);
-    } else if saved.should_disable_cuda_pinned() {
-        removed_items.push("GGML_CUDA_NO_PINNED=1".to_string());
-        change_count += 1;
-    }
+            Some(DiffKind::Modified)
+        }
+    } else {
+        if saved.should_disable_cuda_pinned() {
+            removed.push("GGML_CUDA_NO_PINNED=1".to_string());
+            change_count += 1;
+        }
+        None
+    };
 
     if current.engine_dir_override != saved.engine_dir_override
         || current.engine_kind != saved.engine_kind
         || current.engine_exe_override != saved.engine_exe_override
+        || current.use_manual_flags != saved.use_manual_flags
         || current.use_advanced_flags != saved.use_advanced_flags
     {
         change_count += 1;
@@ -1223,24 +1241,39 @@ pub fn build_diff_layout_job(
     let (cur_pairs, cur_map) = parse_cli_pairs(&cur_args);
     let (sav_pairs, sav_map) = parse_cli_pairs(&sav_args);
 
-    job.append(current.effective_engine_exe(), 0.0, dim_fmt);
+    let mut tokens = Vec::with_capacity(cur_pairs.len());
     for (k, v) in &cur_pairs {
-        job.append(" ", 0.0, white_fmt.clone());
         let pair_str = if v.is_empty() { k.clone() } else { format!("{k} {v}") };
         match sav_map.get(k) {
-            None => { job.append(&pair_str, 0.0, green_fmt.clone()); change_count += 1; }
-            Some(old_v) if old_v != v => { job.append(&pair_str, 0.0, amber_fmt.clone()); change_count += 1; }
-            Some(_) => { job.append(&pair_str, 0.0, white_fmt.clone()); }
+            None => {
+                tokens.push((pair_str, DiffKind::Added));
+                change_count += 1;
+            }
+            Some(old_v) if old_v != v => {
+                tokens.push((pair_str, DiffKind::Modified));
+                change_count += 1;
+            }
+            Some(_) => {
+                tokens.push((pair_str, DiffKind::Unchanged));
+            }
         }
     }
+
     for (k, v) in &sav_pairs {
         if !cur_map.contains_key(k) {
             let pair_str = if v.is_empty() { k.clone() } else { format!("{k} {v}") };
-            removed_items.push(pair_str);
+            removed.push(pair_str);
             change_count += 1;
         }
     }
-    (job, removed_items, change_count)
+
+    CliDiff {
+        exe_name: current.effective_engine_exe().to_string(),
+        env_pinned,
+        tokens,
+        removed,
+        change_count,
+    }
 }
 
 pub type HelpMap = HashMap<(String, String, String), String>;
@@ -1396,7 +1429,7 @@ impl StackConfig {
 
     pub fn build_routing_set_yaml(&self, set: &RoutingSet) -> String {
         let mut out = String::new();
-        out.push_str("# Auto-generated by AI Control Center v1.0\n");
+        out.push_str(&format!("# Auto-generated by AI Control Center v{}\n", env!("CARGO_PKG_VERSION")));
         out.push_str(&format!("# Routing Set: {}\n", set.name));
         out.push_str("healthCheckTimeout: 180\nlogToStdout: \"both\"\n\nmodels:\n");
 
@@ -1432,7 +1465,7 @@ impl StackConfig {
         for pid in &set.profile_ids {
             if let Some(prof) = self.find_profile(pid) {
                 if prof.effective_engine_kind() != "custom" {
-                    if prof.use_advanced_flags {
+                    if (prof.use_manual_flags && !prof.manual_flags.trim().is_empty()) || prof.use_advanced_flags {
                         let sec_name = prof.swap_model_id();
                         out.push_str(&format!("[{sec_name}]\n"));
                         let toks = prof.build_args_with_port(&self.models_dir, "8080");

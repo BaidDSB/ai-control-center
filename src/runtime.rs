@@ -1,15 +1,27 @@
 use crate::config::{ModelProfile, RoutingSet, StackConfig};
-use eframe::egui;
+use crate::platform::{self, CommandExtPlatform};
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
-use crate::platform::{self, CommandExtPlatform};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 const MAX_CONSOLE_LINES: usize = 3500;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiNotifyTarget {
+    Root,
+    Console,
+    Both,
+}
+
+pub type UiNotifier = Arc<dyn Fn(UiNotifyTarget) + Send + Sync>;
+
+pub fn noop_notifier() -> UiNotifier {
+    Arc::new(|_| {})
+}
 
 #[derive(Clone, Copy, Default)]
 pub struct ProcStatus {
@@ -126,8 +138,7 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
     tag: &'static str,
     console: SharedConsole,
     errors: SharedErrors,
-    ctx: egui::Context,
-    vp_id: egui::ViewportId,
+    notify: UiNotifier,
 ) {
     thread::spawn(move || {
         let mut buf_reader = BufReader::new(reader);
@@ -153,9 +164,10 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
                             let num = errs.len() + 1;
                             errs.push(format!("[{tag} ERR #{num}] {cleaned}"));
                         }
-                        ctx.request_repaint_of(egui::ViewportId::ROOT);
+                        notify(UiNotifyTarget::Both);
+                    } else {
+                        notify(UiNotifyTarget::Console);
                     }
-                    ctx.request_repaint_of(vp_id);
                 }
                 Err(_) => break,
             }
@@ -211,6 +223,7 @@ pub fn stop_all_backends(backend_exes: &[String]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_monitored(
     exe: &Path,
     work_dir: &Path,
@@ -221,10 +234,9 @@ fn spawn_monitored(
     tag: &'static str,
     console: SharedConsole,
     errors: SharedErrors,
-    ctx: egui::Context,
-    vp_id: egui::ViewportId,
+    notify: UiNotifier,
 ) -> Result<(), String> {
-    let exe_name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("engine.exe").to_string();
+    let exe_name = exe.file_name().and_then(|s| s.to_str()).unwrap_or("engine").to_string();
     let mut cmd = Command::new(exe);
     cmd.current_dir(work_dir).args(args);
     if disable_pinned {
@@ -254,14 +266,14 @@ fn spawn_monitored(
         .map_err(|e| format!("Failed starting {exe_name}: {e}"))?;
 
     if let Some(stdout) = child.stdout.take() {
-        spawn_pipe_reader(stdout, "", tag, Arc::clone(&console), Arc::clone(&errors), ctx.clone(), vp_id);
+        spawn_pipe_reader(stdout, "", tag, Arc::clone(&console), Arc::clone(&errors), Arc::clone(&notify));
     }
     if let Some(stderr) = child.stderr.take() {
-        spawn_pipe_reader(stderr, "", tag, Arc::clone(&console), Arc::clone(&errors), ctx.clone(), vp_id);
+        spawn_pipe_reader(stderr, "", tag, Arc::clone(&console), Arc::clone(&errors), Arc::clone(&notify));
     }
 
     let wait_console = Arc::clone(&console);
-    let wait_ctx = ctx.clone();
+    let wait_notify = Arc::clone(&notify);
     thread::spawn(move || {
         let status = child.wait();
         if let Ok(mut c) = wait_console.lock() {
@@ -270,11 +282,10 @@ fn spawn_monitored(
                 Err(e) => c.push(format!("[{exe_name} WAIT ERROR] {e}")),
             }
         }
-        wait_ctx.request_repaint_of(vp_id);
-        wait_ctx.request_repaint_of(egui::ViewportId::ROOT);
+        wait_notify(UiNotifyTarget::Both);
     });
 
-    ctx.request_repaint_of(vp_id);
+    notify(UiNotifyTarget::Console);
     Ok(())
 }
 
@@ -283,8 +294,7 @@ pub fn launch_single_profile(
     profile: &ModelProfile,
     console: SharedConsole,
     errors: SharedErrors,
-    ctx: egui::Context,
-    vp_id: egui::ViewportId,
+    notify: UiNotifier,
 ) -> Result<(), String> {
     let engine_kind = profile.effective_engine_kind();
     let engine_dir = profile.effective_engine_dir(&cfg.llama_dir);
@@ -320,8 +330,7 @@ pub fn launch_single_profile(
         "ENGINE",
         console,
         errors,
-        ctx,
-        vp_id,
+        notify,
     )
 }
 
@@ -330,8 +339,7 @@ pub fn launch_routing_set(
     set: &RoutingSet,
     console: SharedConsole,
     errors: SharedErrors,
-    ctx: egui::Context,
-    vp_id: egui::ViewportId,
+    notify: UiNotifier,
 ) -> Result<(), String> {
     if set.profile_ids.is_empty() {
         return Err(format!("Routing Set '{}' has no linked model profiles.", set.name));
@@ -392,15 +400,19 @@ pub fn launch_routing_set(
             "ENGINE",
             console,
             errors,
-            ctx,
-            vp_id,
+            notify,
         );
     }
 
     // Default: Multi-Engine Routing via llama-swap
     let swap_exe = Path::new(&cfg.llama_swap_exe);
+    let swap_name = swap_exe
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("llama-swap");
     if !swap_exe.exists() {
-        return Err(format!("llama-swap.exe not found at {}", swap_exe.display()));
+        return Err(format!("{swap_name} not found at {}", swap_exe.display()));
     }
     for p in &linked {
         let (cmd_check, _) = p.build_swap_cmd_and_env_with_engines(&cfg.models_dir, &cfg.llama_dir, &cfg.saved_engines);
@@ -423,7 +435,7 @@ pub fn launch_routing_set(
     let work_dir = swap_exe.parent().unwrap_or_else(|| Path::new("."));
     let headers = vec![
         format!("[ROUTING SET (llama-swap)] {} ({} models on http://{}/v1)", set.name, linked.len(), listen),
-        format!("[LAUNCH] llama-swap.exe {}", args.join(" ")),
+        format!("[LAUNCH] {swap_name} {}", args.join(" ")),
     ];
     spawn_monitored(
         swap_exe,
@@ -435,8 +447,7 @@ pub fn launch_routing_set(
         "SWAP",
         console,
         errors,
-        ctx,
-        vp_id,
+        notify,
     )
 }
 
@@ -444,8 +455,7 @@ pub fn launch_open_webui(
     cfg: &StackConfig,
     console: SharedConsole,
     errors: SharedErrors,
-    ctx: egui::Context,
-    vp_id: egui::ViewportId,
+    notify: UiNotifier,
 ) -> Result<(), String> {
     let fe_name = cfg.effective_frontend_name().to_string();
     let exe = cfg.effective_frontend_exe_path();
@@ -488,14 +498,14 @@ pub fn launch_open_webui(
         .map_err(|e| format!("Failed starting {fe_name}: {e}"))?;
 
     if let Some(stdout) = child.stdout.take() {
-        spawn_pipe_reader(stdout, "", "FE", Arc::clone(&console), Arc::clone(&errors), ctx.clone(), vp_id);
+        spawn_pipe_reader(stdout, "", "FE", Arc::clone(&console), Arc::clone(&errors), Arc::clone(&notify));
     }
     if let Some(stderr) = child.stderr.take() {
-        spawn_pipe_reader(stderr, "", "FE", Arc::clone(&console), Arc::clone(&errors), ctx.clone(), vp_id);
+        spawn_pipe_reader(stderr, "", "FE", Arc::clone(&console), Arc::clone(&errors), Arc::clone(&notify));
     }
 
     let wait_console = Arc::clone(&console);
-    let wait_ctx = ctx.clone();
+    let wait_notify = Arc::clone(&notify);
     let tag_name = fe_name.clone();
     thread::spawn(move || {
         let status = child.wait();
@@ -505,11 +515,10 @@ pub fn launch_open_webui(
                 Err(e) => c.push(format!("[{tag_name} WAIT ERROR] {e}")),
             }
         }
-        wait_ctx.request_repaint_of(vp_id);
-        wait_ctx.request_repaint_of(egui::ViewportId::ROOT);
+        wait_notify(UiNotifyTarget::Both);
     });
 
-    ctx.request_repaint_of(vp_id);
+    notify(UiNotifyTarget::Console);
     Ok(())
 }
 
