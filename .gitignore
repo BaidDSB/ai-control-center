@@ -8,3 +8,4 @@ help.md
 Thumbs.db
 llama-swap.yaml
 models.ini
+running_state.toml
