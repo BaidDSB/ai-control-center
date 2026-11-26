@@ -15,10 +15,10 @@ use eframe::egui;
 use inspector::{render_advanced_inspector, render_spec_inspector};
 use rfd::FileDialog;
 use runtime::{
-    collect_backend_exes, launch_mcpo, launch_open_webui, launch_routing_set,
-    launch_single_profile, poll_processes_full, run_bat_file, start_companion_service,
-    stop_all_backends, stop_companion_service, stop_process, ConsoleBuffer, ProcStatus,
-    SharedConsole, SharedErrors,
+    active_backend_info, init_running_state, launch_mcpo, launch_open_webui, launch_routing_set,
+    launch_single_profile, poll_tracked_processes, run_bat_file, start_companion_service,
+    stop_companion_service, stop_tracked_backend, stop_tracked_frontend, stop_tracked_mcpo,
+    sync_live_llama_swap_yaml, ConsoleBuffer, ProcStatus, SharedConsole, SharedErrors,
 };
 use sidebar::{render_left_workspace, SidebarDrafts};
 use std::collections::HashMap;
@@ -57,8 +57,6 @@ struct ControlCenterApp {
 
     loaded_label: Option<String>,
     shared_status: Arc<Mutex<ProcStatus>>,
-    shared_exes: Arc<Mutex<Vec<String>>>,
-    shared_fe_exe: Arc<Mutex<String>>,
     shared_comp_ports: Arc<Mutex<Vec<u16>>>,
     llama_console: SharedConsole,
     owu_console: SharedConsole,
@@ -100,130 +98,123 @@ impl ControlCenterApp {
         let saved_cfg = cfg.clone();
         let scanned_models = scan_gguf_models(&cfg.models_dir);
         let help_map = Self::load_help_with_fallback(&cfg.help_md_path, patch.embedded_help_md);
-        let init_exes = collect_backend_exes(&cfg);
-        let init_fe_exe = cfg.effective_frontend_exe_name();
-        let init_comp_ports: Vec<u16> = cfg
-            .companion_services
-            .iter()
-            .map(|s| s.check_port)
-            .collect();
-        let initial = poll_processes_full(&init_exes, &init_fe_exe, &init_comp_ports);
-        let loaded_label = if initial.llama {
-            Some(format!("Active Engine (:{})", cfg.server_port))
-        } else {
-            None
-        };
+        let _ = init_running_state();
+     let init_comp_ports: Vec<u16> = cfg
+         .companion_services
+         .iter()
+         .map(|s| s.check_port)
+         .collect();
+     let initial = poll_tracked_processes(&init_comp_ports);
+     let loaded_label = if initial.llama {
+         active_backend_info()
+             .map(|t| t.label)
+             .filter(|s| !s.trim().is_empty())
+             .or_else(|| Some(format!("Active Engine (:{})", cfg.server_port)))
+     } else {
+         None
+     };
 
-        let shared_status = Arc::new(Mutex::new(initial));
-        let shared_exes = Arc::new(Mutex::new(init_exes));
-        let shared_fe_exe = Arc::new(Mutex::new(init_fe_exe));
-        let shared_comp_ports = Arc::new(Mutex::new(init_comp_ports));
-        let (bg_status, bg_exes, bg_fe, bg_ports, bg_ctx) = (
-            Arc::clone(&shared_status),
-            Arc::clone(&shared_exes),
-            Arc::clone(&shared_fe_exe),
-            Arc::clone(&shared_comp_ports),
-            ctx.clone(),
-        );
+     let shared_status = Arc::new(Mutex::new(initial));
+     let shared_comp_ports = Arc::new(Mutex::new(init_comp_ports));
+     let (bg_status, bg_ports, bg_ctx) = (
+         Arc::clone(&shared_status),
+         Arc::clone(&shared_comp_ports),
+         ctx.clone(),
+     );
 
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(2500));
-            let exes = bg_exes.lock().map(|g| g.clone()).unwrap_or_else(|_| {
-                vec![
-                    platform::default_exe_name("llama-swap"),
-                    platform::default_exe_name("llama-server"),
-                ]
-            });
-            let fe = bg_fe.lock().map(|g| g.clone()).unwrap_or_default();
-            let ports = bg_ports.lock().map(|g| g.clone()).unwrap_or_default();
-            let latest = poll_processes_full(&exes, &fe, &ports);
-            if let Ok(mut guard) = bg_status.lock() {
-                *guard = latest;
-            }
-            bg_ctx.request_repaint_of(egui::ViewportId::ROOT);
-        });
+     thread::spawn(move || loop {
+         thread::sleep(Duration::from_millis(2500));
+         let ports = bg_ports.lock().map(|g| g.clone()).unwrap_or_default();
+         let latest = poll_tracked_processes(&ports);
+         if let Ok(mut guard) = bg_status.lock() {
+             *guard = latest;
+         }
+         bg_ctx.request_repaint_of(egui::ViewportId::ROOT);
+     });
 
-        let sig = (cfg.theme_mode, cfg.accent_rgb, false);
-        let ready_msg = format!(
-            "{} Ready — pick a Routing Set on top, or browse Model Families -> Sub-Profiles below.",
-            patch.effective_version()
-        );
-        Self {
-            patch,
-            cfg,
-            saved_cfg,
-            scanned_models,
-            gguf_cache: HashMap::new(),
-            help_map,
-            sidebar_drafts: SidebarDrafts::new(),
-            loaded_label,
-            shared_status,
-            shared_exes,
-            shared_fe_exe,
-            shared_comp_ports,
-            llama_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
-            owu_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
-            show_llama_console: Arc::new(AtomicBool::new(false)),
-            show_owu_console: Arc::new(AtomicBool::new(false)),
-            error_logs: Arc::new(Mutex::new(Vec::new())),
-            show_error_log: false,
-            show_plain_hints: true,
-            show_theme_bar: false,
-            right_drawer: None,
-            code_scope: CodePreviewScope::RoutingSet,
-            live_code_select_mode: false,
-            copied_code_at: -10.0,
-            edit_mode: false,
-            applied_theme_sig: sig,
-            status_msg: ready_msg,
-        }
-    }
+     let sig = (cfg.theme_mode, cfg.accent_rgb, false);
+     let ready_msg = format!(
+         "{} Ready — pick a Routing Set on top, or browse Model Families -> Sub-Profiles below.",
+         patch.effective_version()
+     );
+     Self {
+         patch,
+         cfg,
+         saved_cfg,
+         scanned_models,
+         gguf_cache: HashMap::new(),
+         help_map,
+         sidebar_drafts: SidebarDrafts::new(),
+         loaded_label,
+         shared_status,
+         shared_comp_ports,
+         llama_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
+         owu_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
+         show_llama_console: Arc::new(AtomicBool::new(false)),
+         show_owu_console: Arc::new(AtomicBool::new(false)),
+         error_logs: Arc::new(Mutex::new(Vec::new())),
+         show_error_log: false,
+         show_plain_hints: true,
+         show_theme_bar: false,
+         right_drawer: None,
+         code_scope: CodePreviewScope::RoutingSet,
+         live_code_select_mode: false,
+         copied_code_at: -10.0,
+         edit_mode: false,
+         applied_theme_sig: sig,
+         status_msg: ready_msg,
+     }
+ }
 
-    fn sync_backend_exes(&self) {
-        if let Ok(mut g) = self.shared_exes.lock() {
-            *g = collect_backend_exes(&self.cfg);
-        }
-        if let Ok(mut g) = self.shared_fe_exe.lock() {
-            *g = self.cfg.effective_frontend_exe_name();
-        }
-        if let Ok(mut g) = self.shared_comp_ports.lock() {
-            *g = self
-                .cfg
-                .companion_services
-                .iter()
-                .map(|s| s.check_port)
-                .collect();
-        }
-    }
+ fn sync_backend_exes(&self) {
+     if let Ok(mut g) = self.shared_comp_ports.lock() {
+         *g = self
+             .cfg
+             .companion_services
+             .iter()
+             .map(|s| s.check_port)
+             .collect();
+     }
+ }
 
-    fn reload_help(&mut self) {
-        self.help_map =
-            Self::load_help_with_fallback(&self.cfg.help_md_path, self.patch.embedded_help_md);
-        self.status_msg = format!("Reloaded help notes from {}", self.cfg.help_md_path);
-    }
+ fn reload_help(&mut self) {
+     self.help_map =
+         Self::load_help_with_fallback(&self.cfg.help_md_path, self.patch.embedded_help_md);
+     self.status_msg = format!("Reloaded help notes from {}", self.cfg.help_md_path);
+ }
 
-    fn push_error(&mut self, err: String) {
-        let num = if let Ok(mut logs) = self.error_logs.lock() {
-            let n = logs.len() + 1;
-            logs.push(format!("[ERR #{n}] {err}"));
-            n
-        } else {
-            1
-        };
-        self.show_error_log = true;
-        self.status_msg = format!("Error #{num} logged — open Error Log below.");
-    }
+ fn push_error(&mut self, err: String) {
+     let num = if let Ok(mut logs) = self.error_logs.lock() {
+         let n = logs.len() + 1;
+         logs.push(format!("[ERR #{n}] {err}"));
+         n
+     } else {
+         1
+     };
+     self.show_error_log = true;
+     self.status_msg = format!("Error #{num} logged — open Error Log below.");
+ }
 
-    fn save_now(&mut self, note: &str) {
-        self.sync_backend_exes();
-        match self.cfg.save() {
-            Ok(()) => {
-                self.saved_cfg = self.cfg.clone();
-                self.status_msg = note.to_string();
-            }
-            Err(e) => self.push_error(format!("Config save failed: {e}")),
-        }
-    }
+ fn save_now(&mut self, note: &str) {
+     self.sync_backend_exes();
+     match self.cfg.save() {
+         Ok(()) => {
+             self.saved_cfg = self.cfg.clone();
+             match sync_live_llama_swap_yaml(&self.cfg) {
+                 Ok(true) => {
+                     self.status_msg = format!("{note} (Synced live llama-swap.yaml)");
+                 }
+                 Ok(false) => {
+                     self.status_msg = note.to_string();
+                 }
+                 Err(e) => {
+                     self.status_msg = format!("{note} (Live YAML sync skipped: {e})");
+                 }
+             }
+         }
+         Err(e) => self.push_error(format!("Config save failed: {e}")),
+     }
+ }
 
     fn current_procs(&self) -> ProcStatus {
         self.shared_status.lock().map(|g| *g).unwrap_or_default()
@@ -566,8 +557,7 @@ impl eframe::App for ControlCenterApp {
                         .clicked()
                     {
                         if procs.llama {
-                            let exes = collect_backend_exes(&self.cfg);
-                            stop_all_backends(&exes);
+                            stop_tracked_backend();
                             self.loaded_label = None;
                             procs.llama = false;
                             self.set_procs(procs);
@@ -600,7 +590,6 @@ impl eframe::App for ControlCenterApp {
                     }
 
                     let fe_name = self.cfg.effective_frontend_name().to_string();
-                    let fe_exe = self.cfg.effective_frontend_exe_name();
                     let owu_lbl = if procs.owu {
                         format!("{fe_name} (:{}): ON", self.cfg.owu_port)
                     } else {
@@ -625,7 +614,7 @@ impl eframe::App for ControlCenterApp {
                         .clicked()
                     {
                         if procs.owu {
-                            stop_process(&fe_exe);
+                            stop_tracked_frontend();
                             procs.owu = false;
                             self.set_procs(procs);
                             self.status_msg = format!("Stopped {fe_name}.");
@@ -731,7 +720,7 @@ impl eframe::App for ControlCenterApp {
                                 .clicked()
                             {
                                 if procs.mcpo {
-                                    stop_process(&platform::default_exe_name("mcpo"));
+                                    stop_tracked_mcpo();
                                     procs.mcpo = false;
                                     self.set_procs(procs);
                                 } else if let Err(e) = launch_mcpo(&self.cfg) {
@@ -865,10 +854,9 @@ impl eframe::App for ControlCenterApp {
                     )
                     .fill(egui::Color32::from_rgb(145, 32, 38));
                     if ui.add(stop_all).clicked() {
-                        let exes = collect_backend_exes(&self.cfg);
-                        stop_all_backends(&exes);
-                        stop_process(&fe_exe);
-                        stop_process(&platform::default_exe_name("mcpo"));
+                        stop_tracked_backend();
+                        stop_tracked_frontend();
+                        stop_tracked_mcpo();
                         if cfg!(feature = "plus") {
                             for (ci, svc) in self.cfg.companion_services.iter().enumerate() {
                                 if svc.enabled
@@ -1094,8 +1082,7 @@ impl eframe::App for ControlCenterApp {
                                         )
                                         .fill(egui::Color32::from_rgb(153, 27, 27));
                                         if ui.add_sized([100.0, 32.0], unload_btn).clicked() {
-                                            let exes = collect_backend_exes(&self.cfg);
-                                            stop_all_backends(&exes);
+                                            stop_tracked_backend();
                                             self.loaded_label = None;
                                             procs.llama = false;
                                             self.set_procs(procs);
