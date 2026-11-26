@@ -133,50 +133,50 @@ pub(crate) fn palette_for(mode: ThemeMode, accent_rgb: [u8; 3], edit_mode: bool)
             btn_idle_text: egui::Color32::from_rgb(236, 240, 246),
             edit_hl: w,
         },
-        // Warm matte paper Light theme (low glare, no pure #FFFFFF surfaces)
+        // Warm cream Light theme anchored on #F7F1E6 (247, 241, 230)
         ThemeMode::Light if edit_mode => {
-            let ink = egui::Color32::from_rgb(34, 31, 27);
+            let ink = egui::Color32::from_rgb(32, 28, 24);
             UiPalette {
-                canvas: egui::Color32::from_rgb(222, 217, 208),
-                card_bg: egui::Color32::from_rgb(235, 231, 223),
+                canvas: egui::Color32::from_rgb(234, 226, 212),
+                card_bg: egui::Color32::from_rgb(247, 241, 230),
                 card_border: ink,
-                item_bg: egui::Color32::from_rgb(229, 224, 215),
-                item_border: egui::Color32::from_rgb(144, 137, 126),
-                item_sel_bg: egui::Color32::from_rgb(211, 205, 194),
+                item_bg: egui::Color32::from_rgb(239, 232, 219),
+                item_border: egui::Color32::from_rgb(156, 147, 132),
+                item_sel_bg: egui::Color32::from_rgb(224, 215, 199),
                 item_sel_border: ink,
-                sub_sel_bg: egui::Color32::from_rgb(211, 205, 194),
+                sub_sel_bg: egui::Color32::from_rgb(224, 215, 199),
                 sub_sel_border: ink,
-                code_bg: egui::Color32::from_rgb(218, 212, 202),
+                code_bg: egui::Color32::from_rgb(230, 222, 207),
                 text: ink,
-                muted: egui::Color32::from_rgb(95, 89, 81),
+                muted: egui::Color32::from_rgb(96, 88, 77),
                 accent,
                 accent_text,
-                btn_idle: egui::Color32::from_rgb(212, 206, 196),
+                btn_idle: egui::Color32::from_rgb(226, 218, 203),
                 btn_idle_text: ink,
                 edit_hl: ink,
             }
         }
         ThemeMode::Light => {
-            let paper = egui::Color32::from_rgb(236, 232, 224);
-            let em_warm = egui::Color32::from_rgb(15, 148, 102);
-            let ink = egui::Color32::from_rgb(36, 33, 29);
+            let paper = egui::Color32::from_rgb(247, 241, 230); // #F7F1E6
+            let em_warm = egui::Color32::from_rgb(14, 142, 96);
+            let ink = egui::Color32::from_rgb(36, 32, 27);
             UiPalette {
-                canvas: egui::Color32::from_rgb(224, 219, 210),
+                canvas: egui::Color32::from_rgb(237, 229, 215),
                 card_bg: paper,
-                card_border: egui::Color32::from_rgb(192, 185, 173),
-                item_bg: egui::Color32::from_rgb(230, 225, 216),
-                item_border: egui::Color32::from_rgb(198, 191, 179),
+                card_border: egui::Color32::from_rgb(209, 199, 183),
+                item_bg: egui::Color32::from_rgb(241, 234, 221),
+                item_border: egui::Color32::from_rgb(216, 206, 190),
                 item_sel_bg: blend_color(paper, accent, 0.16),
                 item_sel_border: accent,
                 sub_sel_bg: blend_color(paper, em_warm, 0.16),
                 sub_sel_border: em_warm,
-                code_bg: egui::Color32::from_rgb(220, 214, 204),
+                code_bg: egui::Color32::from_rgb(232, 224, 210),
                 text: ink,
-                muted: egui::Color32::from_rgb(104, 98, 89),
+                muted: egui::Color32::from_rgb(106, 98, 86),
                 accent,
                 accent_text,
-                btn_idle: egui::Color32::from_rgb(214, 208, 198),
-                btn_idle_text: egui::Color32::from_rgb(38, 35, 31),
+                btn_idle: egui::Color32::from_rgb(230, 222, 207),
+                btn_idle_text: ink,
                 edit_hl: ink,
             }
         }
