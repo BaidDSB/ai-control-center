@@ -91,11 +91,19 @@ impl ControlCenterApp {
     }
 
     fn new(ctx: egui::Context, patch: AppPatch) -> Self {
-        let cfg = StackConfig::load_with_hooks(
+        let mut cfg = StackConfig::load_with_hooks(
             patch.default_config_fn,
             patch.legacy_migrator_fn,
             patch.post_load_fn,
         );
+        if cfg.secondary_node.host.trim().is_empty() {
+            if let Some(ep) = patch.default_rpc_endpoint.as_deref() {
+                if let Some((host, port)) = crate::config::SecondaryNodeConfig::parse_host_port(ep) {
+                    cfg.secondary_node.host = host;
+                    cfg.secondary_node.rpc_port = port;
+                }
+            }
+        }
         let saved_cfg = cfg.clone();
         let scanned_models = scan_gguf_models(&cfg.models_dir);
         let help_map = Self::load_help_with_fallback(&cfg.help_md_path, patch.embedded_help_md);
@@ -829,6 +837,22 @@ impl eframe::App for ControlCenterApp {
                                                     .selectable(false),
                                                 );
 
+                                                let sec_rpc_ep = self
+                                                    .cfg
+                                                    .secondary_node
+                                                    .rpc_endpoint()
+                                                    .or_else(|| {
+                                                        let legacy = prof.single.rpc_endpoint.trim();
+                                                        if !self.cfg.secondary_node.enabled
+                                                            && self.cfg.secondary_node.host.trim().is_empty()
+                                                            && !legacy.is_empty()
+                                                        {
+                                                            Some(legacy.to_string())
+                                                        } else {
+                                                            None
+                                                        }
+                                                    });
+                                                let rpc_fallback = self.cfg.secondary_node.rpc_fallback;
                                                 let mut port_copy = prof.port;
                                                 render_spec_inspector(
                                                     ui,
@@ -841,6 +865,8 @@ impl eframe::App for ControlCenterApp {
                                                     &mut self.scanned_models,
                                                     &mut self.gguf_cache,
                                                     &mut port_copy,
+                                                    sec_rpc_ep.as_deref(),
+                                                    rpc_fallback,
                                                     "cc_single_slot",
                                                     &mut trigger_save_msg,
                                                 );

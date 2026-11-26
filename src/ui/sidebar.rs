@@ -21,6 +21,7 @@ pub(crate) struct SidebarDrafts {
     pub new_engine_exe: String,
     pub new_engine_args: String,
     pub new_engine_color: [u8; 3],
+    pub rpc_test_status: Option<(bool, String)>,
 }
 
 impl SidebarDrafts {
@@ -35,6 +36,7 @@ impl SidebarDrafts {
             new_engine_exe: platform::default_exe_name("llama-server"),
             new_engine_args: String::new(),
             new_engine_color: ENGINE_COLOR_PALETTE[1],
+            rpc_test_status: None,
         }
     }
 }

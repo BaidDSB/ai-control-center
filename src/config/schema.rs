@@ -370,6 +370,96 @@ pub struct RoutingSet {
     pub profile_ids: Vec<String>,
 }
 
+fn default_secondary_label() -> String {
+    "Secondary Node".to_string()
+}
+fn default_rpc_port() -> u16 {
+    50052
+}
+fn default_peer_port() -> u16 {
+    8080
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RpcFallbackPolicy {
+    #[default]
+    Auto,
+    Strict,
+}
+
+impl RpcFallbackPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (120ms fallback)",
+            Self::Strict => "Strict (require node)",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SecondaryNodeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_secondary_label")]
+    pub label: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default = "default_rpc_port")]
+    pub rpc_port: u16,
+    #[serde(default = "default_peer_port")]
+    pub peer_port: u16,
+    #[serde(default)]
+    pub rpc_fallback: RpcFallbackPolicy,
+}
+
+impl Default for SecondaryNodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            label: default_secondary_label(),
+            host: String::new(),
+            rpc_port: default_rpc_port(),
+            peer_port: default_peer_port(),
+            rpc_fallback: RpcFallbackPolicy::Auto,
+        }
+    }
+}
+
+impl SecondaryNodeConfig {
+    pub fn rpc_endpoint(&self) -> Option<String> {
+        let host = self.host.trim();
+        if !self.enabled || host.is_empty() || self.rpc_port == 0 {
+            return None;
+        }
+        if host.contains(':') && !host.starts_with('[') {
+            Some(format!("[{host}]:{}", self.rpc_port))
+        } else {
+            Some(format!("{host}:{}", self.rpc_port))
+        }
+    }
+
+    pub fn parse_host_port(endpoint: &str) -> Option<(String, u16)> {
+        let s = endpoint.trim();
+        if s.is_empty() {
+            return None;
+        }
+        if let Some(rest) = s.strip_prefix('[') {
+            let (h, p) = rest.split_once("]:")?;
+            let port = p.trim().parse::<u16>().ok()?;
+            if h.trim().is_empty() || port == 0 {
+                return None;
+            }
+            return Some((h.trim().to_string(), port));
+        }
+        let (h, p) = s.rsplit_once(':')?;
+        let port = p.trim().parse::<u16>().ok()?;
+        if h.trim().is_empty() || port == 0 {
+            return None;
+        }
+        Some((h.trim().to_string(), port))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct StackConfig {
     pub app_title: String,
@@ -417,6 +507,8 @@ pub struct StackConfig {
     pub selected_group_idx: usize,
     #[serde(default)]
     pub selected_profile_idx: usize,
+    #[serde(default)]
+    pub secondary_node: SecondaryNodeConfig,
     pub routing_sets: Vec<RoutingSet>,
     pub groups: Vec<ModelGroup>,
 }
@@ -558,6 +650,68 @@ impl StackConfig {
         }
     }
 
+    pub fn migrate_legacy_rpc_to_secondary_node(&mut self) {
+        if !self.secondary_node.host.trim().is_empty() {
+            return;
+        }
+        let mut fallback_ep: Option<String> = None;
+        let mut preferred_ep: Option<String> = None;
+        for g in &self.groups {
+            for p in &g.profiles {
+                if !p.single.use_rpc {
+                    continue;
+                }
+                let ep = p.single.rpc_endpoint.trim();
+                if ep.is_empty() {
+                    continue;
+                }
+                if !ep.starts_with("127.0.0.1:") && !ep.starts_with("localhost:") {
+                    preferred_ep = Some(ep.to_string());
+                    break;
+                } else if fallback_ep.is_none() {
+                    fallback_ep = Some(ep.to_string());
+                }
+            }
+            if preferred_ep.is_some() {
+                break;
+            }
+        }
+        if let Some(ep) = preferred_ep.or(fallback_ep) {
+            if let Some((host, port)) = SecondaryNodeConfig::parse_host_port(&ep) {
+                self.secondary_node.enabled = true;
+                self.secondary_node.host = host;
+                self.secondary_node.rpc_port = port;
+            }
+        }
+    }
+
+    pub fn effective_rpc_for_profile(
+        &self,
+        spec: &ModelSpec,
+        node_reachable: Option<bool>,
+    ) -> Option<String> {
+        if !spec.use_rpc {
+            return None;
+        }
+        let ep = self.secondary_node.rpc_endpoint().or_else(|| {
+            let legacy = spec.rpc_endpoint.trim();
+            if !self.secondary_node.enabled
+                && self.secondary_node.host.trim().is_empty()
+                && !legacy.is_empty()
+            {
+                Some(legacy.to_string())
+            } else {
+                None
+            }
+        })?;
+        if node_reachable == Some(false)
+            && self.secondary_node.rpc_fallback == RpcFallbackPolicy::Auto
+        {
+            return None;
+        }
+        Some(ep)
+    }
+
     pub fn load() -> Self {
         Self::load_with_hooks(None, None, None)
     }
@@ -579,6 +733,7 @@ impl StackConfig {
                     if !cfg.routing_sets.is_empty() && cfg.selected_set_idx >= cfg.routing_sets.len() {
                         cfg.selected_set_idx = 0;
                     }
+                    cfg.migrate_legacy_rpc_to_secondary_node();
                     if let Some(post) = post_load_fn { post(&mut cfg); }
                     return cfg;
                 }
@@ -602,6 +757,7 @@ impl StackConfig {
                     migrated.theme_mode = tm;
                     migrated.accent_rgb = acc;
                 }
+                migrated.migrate_legacy_rpc_to_secondary_node();
                 if let Some(post) = post_load_fn { post(&mut migrated); }
                 let _ = migrated.save();
                 return migrated;
@@ -688,6 +844,7 @@ impl Default for StackConfig {
             selected_set_idx: 0,
             selected_group_idx: 0,
             selected_profile_idx: 0,
+            secondary_node: SecondaryNodeConfig::default(),
             routing_sets: vec![RoutingSet {
                 id: "default-set".to_string(),
                 name: "Default Set".to_string(),

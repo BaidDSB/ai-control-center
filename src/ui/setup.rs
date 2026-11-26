@@ -1,6 +1,7 @@
 use super::sidebar::{SidebarDrafts, SidebarOutcome};
 use super::theme::{default_engine_rgb, pasteable_singleline, UiPalette, ENGINE_COLOR_PALETTE};
-use crate::config::{self, scan_gguf_models, EnginePreset, GgufInfo, StackConfig};
+use crate::config::{self, scan_gguf_models, EnginePreset, GgufInfo, RpcFallbackPolicy, StackConfig};
+use crate::runtime;
 use crate::platform;
 use eframe::egui;
 use rfd::FileDialog;
@@ -488,6 +489,99 @@ pub(crate) fn render_setup_card(
                     outcome.sync_exes = true;
                     outcome.save_note = Some("Updated Frontend settings.".to_string());
                 }
+                egui::CollapsingHeader::new(
+                    egui::RichText::new("Secondary Node (LAN / RPC)")
+                        .strong()
+                        .color(pal.accent),
+                )
+                .default_open(cfg.secondary_node.enabled)
+                .show(ui, |ui| {
+                    let mut sn_dirty = false;
+                    if ui
+                        .checkbox(&mut cfg.secondary_node.enabled, "Enable Secondary Node")
+                        .on_hover_text("Centralized LAN GPU node used by all RPC-enabled profiles (and llama-swap peers).")
+                        .changed()
+                    {
+                        sn_dirty = true;
+                        drafts.rpc_test_status = None;
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Label:");
+                        if pasteable_singleline(ui, &mut cfg.secondary_node.label, 165.0, "Secondary Node").lost_focus() {
+                            sn_dirty = true;
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Host/IP:");
+                        if pasteable_singleline(ui, &mut cfg.secondary_node.host, 155.0, "192.168.x.x").lost_focus() {
+                            sn_dirty = true;
+                            drafts.rpc_test_status = None;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("RPC Port:");
+                        if ui.add(egui::DragValue::new(&mut cfg.secondary_node.rpc_port).range(1..=65535)).changed() {
+                            sn_dirty = true;
+                            drafts.rpc_test_status = None;
+                        }
+                        ui.label("Peer Port:").on_hover_text("HTTP port on the secondary node for llama-swap peer routing.");
+                        if ui.add(egui::DragValue::new(&mut cfg.secondary_node.peer_port).range(1..=65535)).changed() {
+                            sn_dirty = true;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("RPC Policy:")
+                            .on_hover_text("Auto probes TCP (120ms) at launch and falls back locally if the node is off. Strict always passes --rpc.");
+                        let prev_pol = cfg.secondary_node.rpc_fallback;
+                        egui::ComboBox::from_id_salt("cc_setup_rpc_policy")
+                            .width(155.0)
+                            .selected_text(cfg.secondary_node.rpc_fallback.label())
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut cfg.secondary_node.rpc_fallback,
+                                    RpcFallbackPolicy::Auto,
+                                    RpcFallbackPolicy::Auto.label(),
+                                );
+                                ui.selectable_value(
+                                    &mut cfg.secondary_node.rpc_fallback,
+                                    RpcFallbackPolicy::Strict,
+                                    RpcFallbackPolicy::Strict.label(),
+                                );
+                            });
+                        if cfg.secondary_node.rpc_fallback != prev_pol {
+                            sn_dirty = true;
+                        }
+                    });
+                    ui.horizontal_wrapped(|ui| {
+                        let host_t = cfg.secondary_node.host.trim();
+                        let can_test = !host_t.is_empty() && cfg.secondary_node.rpc_port > 0;
+                        if ui
+                            .add_enabled(can_test, egui::Button::new("Test RPC"))
+                            .on_hover_text("Quick 350ms TCP connect test against Host:RPC Port")
+                            .clicked()
+                        {
+                            let ep = format!("{}:{}", host_t, cfg.secondary_node.rpc_port);
+                            let ok = runtime::probe_tcp_endpoint(&ep, 350);
+                            drafts.rpc_test_status = Some(if ok {
+                                (true, format!("Online ({ep})"))
+                            } else {
+                                (false, format!("Offline ({ep})"))
+                            });
+                        }
+                        if let Some((ok, msg)) = &drafts.rpc_test_status {
+                            let col = if *ok {
+                                egui::Color32::from_rgb(52, 211, 153)
+                            } else {
+                                egui::Color32::from_rgb(248, 113, 113)
+                            };
+                            ui.label(egui::RichText::new(msg).size(11.0).strong().color(col));
+                        }
+                    });
+                    if sn_dirty {
+                        outcome.save_note = Some("Updated Secondary Node settings.".to_string());
+                    }
+                });
+                ui.add_space(4.0);
                 ui.horizontal_wrapped(|ui| {
                     ui.label("API:");
                     ui.add(egui::DragValue::new(&mut cfg.server_port).range(1024..=65535));

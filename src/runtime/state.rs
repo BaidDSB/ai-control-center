@@ -276,3 +276,23 @@ pub fn stop_process(exe_name: &str) {
 pub fn stop_all_backends(_backend_exes: &[String]) {
     stop_tracked_backend();
 }
+
+pub const RPC_PROBE_TIMEOUT_MS: u64 = 120;
+
+pub fn probe_tcp_endpoint(endpoint: &str, timeout_ms: u64) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let trimmed = endpoint.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(addrs) = trimmed.to_socket_addrs() else {
+        return false;
+    };
+    let timeout = Duration::from_millis(timeout_ms.max(10));
+    for addr in addrs {
+        if TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return true;
+        }
+    }
+    false
+}

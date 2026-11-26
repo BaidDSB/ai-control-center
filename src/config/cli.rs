@@ -130,7 +130,25 @@ impl ModelSpec {
         }
     }
 
+    pub fn legacy_rpc_opt(&self) -> Option<&str> {
+        if self.use_rpc && !self.rpc_endpoint.trim().is_empty() {
+            Some(self.rpc_endpoint.trim())
+        } else {
+            None
+        }
+    }
+
     pub fn build_cli_args_with_port(&self, models_dir: &str, host: &str, port_token: &str) -> Vec<String> {
+        self.build_cli_args_with_port_and_rpc(models_dir, host, port_token, self.legacy_rpc_opt())
+    }
+
+    pub fn build_cli_args_with_port_and_rpc(
+        &self,
+        models_dir: &str,
+        host: &str,
+        port_token: &str,
+        resolved_rpc: Option<&str>,
+    ) -> Vec<String> {
         let full_model_path = Path::new(models_dir).join(&self.model_rel_path);
         let mut args = vec!["-m".to_string(), full_model_path.to_string_lossy().to_string()];
 
@@ -244,8 +262,8 @@ impl ModelSpec {
 
         self.append_missing_sampler_args(&mut args);
 
-        if self.use_rpc && !self.rpc_endpoint.trim().is_empty() {
-            args.extend(["--rpc".to_string(), self.rpc_endpoint.trim().to_string(), "--cache-ram".to_string(), "0".to_string()]);
+        if let Some(ep) = resolved_rpc.map(str::trim).filter(|s| !s.is_empty()) {
+            args.extend(["--rpc".to_string(), ep.to_string(), "--cache-ram".to_string(), "0".to_string()]);
         } else if self.cache_ram_mib >= 0 {
             args.extend(["--cache-ram".to_string(), self.cache_ram_mib.to_string()]);
         }
@@ -302,6 +320,15 @@ impl ModelSpec {
     }
 
     pub fn build_ini_section(&self, models_dir: &str, fallback_name: &str) -> String {
+        self.build_ini_section_with_rpc(models_dir, fallback_name, self.legacy_rpc_opt())
+    }
+
+    pub fn build_ini_section_with_rpc(
+        &self,
+        models_dir: &str,
+        fallback_name: &str,
+        resolved_rpc: Option<&str>,
+    ) -> String {
         let sec_name = if !self.alias.trim().is_empty() {
             self.alias.trim()
         } else if !self.slot_name.trim().is_empty() {
@@ -403,8 +430,8 @@ impl ModelSpec {
             }
         }
 
-        if self.use_rpc && !self.rpc_endpoint.trim().is_empty() {
-            lines.push(format!("rpc = {}", self.rpc_endpoint.trim()));
+        if let Some(ep) = resolved_rpc.map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("rpc = {ep}"));
             lines.push("cache-ram = 0".to_string());
         } else if self.cache_ram_mib >= 0 {
             lines.push(format!("cache-ram = {}", self.cache_ram_mib));
@@ -514,6 +541,15 @@ impl ModelProfile {
     }
 
     pub fn build_args_with_port(&self, models_dir: &str, port_token: &str) -> Vec<String> {
+        self.build_args_with_port_and_rpc(models_dir, port_token, self.single.legacy_rpc_opt())
+    }
+
+    pub fn build_args_with_port_and_rpc(
+        &self,
+        models_dir: &str,
+        port_token: &str,
+        resolved_rpc: Option<&str>,
+    ) -> Vec<String> {
         if self.use_manual_flags && !self.manual_flags.trim().is_empty() {
             self.build_manual_args_with_port(models_dir, &self.host, port_token)
         } else if self.effective_engine_kind() == "custom" {
@@ -534,12 +570,16 @@ impl ModelProfile {
                     .collect()
             }
         } else {
-            self.single.build_cli_args_with_port(models_dir, &self.host, port_token)
+            self.single.build_cli_args_with_port_and_rpc(models_dir, &self.host, port_token, resolved_rpc)
         }
     }
 
     pub fn build_llama_args(&self, models_dir: &str) -> Vec<String> {
         self.build_args_with_port(models_dir, &self.port.to_string())
+    }
+
+    pub fn build_llama_args_with_rpc(&self, models_dir: &str, resolved_rpc: Option<&str>) -> Vec<String> {
+        self.build_args_with_port_and_rpc(models_dir, &self.port.to_string(), resolved_rpc)
     }
 
     pub fn expand_custom_template(&self, template: &str, models_dir: &str, port_token: &str) -> Vec<String> {
@@ -564,6 +604,10 @@ impl ModelProfile {
 
 
     pub fn code_text(&self, models_dir: &str) -> String {
+        self.code_text_with_rpc(models_dir, self.single.legacy_rpc_opt())
+    }
+
+    pub fn code_text_with_rpc(&self, models_dir: &str, resolved_rpc: Option<&str>) -> String {
         let env_prefix = if self.should_disable_cuda_pinned() {
             "$env:GGML_CUDA_NO_PINNED = \"1\"\n"
         } else {
@@ -572,7 +616,7 @@ impl ModelProfile {
         format!(
             "{env_prefix}{} {}",
             self.effective_engine_exe(),
-            self.build_llama_args(models_dir).join(" ")
+            self.build_llama_args_with_rpc(models_dir, resolved_rpc).join(" ")
         )
     }
 }
@@ -618,10 +662,22 @@ pub struct CliDiff {
     pub change_count: usize,
 }
 
-pub fn compute_cli_diff(
+pub fn compute_cli_diff(current: &ModelProfile, saved: &ModelProfile, models_dir: &str) -> CliDiff {
+    compute_cli_diff_with_rpc(
+        current,
+        saved,
+        models_dir,
+        current.single.legacy_rpc_opt(),
+        saved.single.legacy_rpc_opt(),
+    )
+}
+
+pub fn compute_cli_diff_with_rpc(
     current: &ModelProfile,
     saved: &ModelProfile,
     models_dir: &str,
+    cur_rpc: Option<&str>,
+    sav_rpc: Option<&str>,
 ) -> CliDiff {
     let mut removed = Vec::new();
     let mut change_count = 0usize;
@@ -650,8 +706,8 @@ pub fn compute_cli_diff(
         change_count += 1;
     }
 
-    let cur_args = current.build_llama_args(models_dir);
-    let sav_args = saved.build_llama_args(models_dir);
+    let cur_args = current.build_llama_args_with_rpc(models_dir, cur_rpc);
+    let sav_args = saved.build_llama_args_with_rpc(models_dir, sav_rpc);
     let (cur_pairs, cur_map) = parse_cli_pairs(&cur_args);
     let (sav_pairs, sav_map) = parse_cli_pairs(&sav_args);
 

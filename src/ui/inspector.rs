@@ -1,5 +1,5 @@
 use super::theme::{pasteable_singleline, pill_switch, plain_help_row, UiPalette};
-use crate::config::{probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec};
+use crate::config::{probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec, RpcFallbackPolicy};
 use crate::runtime;
 use eframe::egui;
 use rfd::FileDialog;
@@ -35,6 +35,8 @@ pub(crate) fn render_spec_inspector(
     scanned_models: &mut Vec<String>,
     gguf_cache: &mut HashMap<String, GgufInfo>,
     port_val: &mut u16,
+    secondary_rpc_ep: Option<&str>,
+    rpc_fallback: RpcFallbackPolicy,
     id_salt: &str,
     trigger_save_msg: &mut Option<String>,
 ) {
@@ -220,10 +222,28 @@ pub(crate) fn render_spec_inspector(
                     "RPC: OFF",
                     edit_mode,
                     pal,
-                    "Pools remote GPU VRAM over LAN (--rpc). Keep on its own sub-profile so daily sets work when the remote node is off.",
+                    "Pools remote GPU VRAM from the centralized Secondary Node configured in Setup. Auto policy falls back locally in 120ms if the node is off.",
                 );
                 if spec.use_rpc {
-                    pasteable_singleline(ui, &mut spec.rpc_endpoint, 165.0, "192.168.x.x:50052");
+                    let pol_tag = match rpc_fallback {
+                        RpcFallbackPolicy::Auto => "Auto",
+                        RpcFallbackPolicy::Strict => "Strict",
+                    };
+                    if let Some(ep) = secondary_rpc_ep {
+                        ui.label(
+                            egui::RichText::new(format!("-> {ep} ({pol_tag})"))
+                                .size(11.5)
+                                .color(c_vram),
+                        )
+                        .on_hover_text("Managed centrally in Edit Mode -> Setup -> Secondary Node (LAN / RPC).");
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No Secondary Node enabled (set in Setup)")
+                                .size(11.0)
+                                .color(c_qual),
+                        )
+                        .on_hover_text("Enable Edit Mode -> Setup -> Secondary Node (LAN / RPC) to set Host/IP and RPC Port.");
+                    }
                 }
             });
             plain_help_row(

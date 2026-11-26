@@ -170,4 +170,66 @@ mod tests {
     fn slugify_normalizes_spaces_and_case() {
         assert_eq!(slugify("My Test Set 1"), "my-test-set-1");
     }
+
+    #[test]
+    fn secondary_node_resolves_auto_and_strict_rpc_fallback() {
+        let mut cfg = StackConfig::default();
+        cfg.secondary_node.enabled = true;
+        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.rpc_port = 50052;
+        cfg.secondary_node.rpc_fallback = RpcFallbackPolicy::Auto;
+
+        let mut prof = ModelProfile::default();
+        prof.single.use_rpc = true;
+        prof.single.cache_ram_mib = 1024;
+
+        // Auto + reachable -> uses centralized endpoint and forces --cache-ram 0
+        let ep_ok = cfg.effective_rpc_for_profile(&prof.single, Some(true));
+        assert_eq!(ep_ok.as_deref(), Some("192.168.0.245:50052"));
+        let args_ok = prof.build_llama_args_with_rpc("D:\\Models", ep_ok.as_deref());
+        assert!(args_ok.windows(2).any(|w| w == ["--rpc", "192.168.0.245:50052"]));
+        assert!(args_ok.windows(2).any(|w| w == ["--cache-ram", "0"]));
+
+        // Auto + unreachable -> omits --rpc and restores profile --cache-ram
+        let ep_down = cfg.effective_rpc_for_profile(&prof.single, Some(false));
+        assert_eq!(ep_down, None);
+        let args_down = prof.build_llama_args_with_rpc("D:\\Models", ep_down.as_deref());
+        assert!(!args_down.iter().any(|a| a == "--rpc"));
+        assert!(args_down.windows(2).any(|w| w == ["--cache-ram", "1024"]));
+
+        // Strict + unreachable -> still emits --rpc
+        cfg.secondary_node.rpc_fallback = RpcFallbackPolicy::Strict;
+        let ep_strict = cfg.effective_rpc_for_profile(&prof.single, Some(false));
+        assert_eq!(ep_strict.as_deref(), Some("192.168.0.245:50052"));
+    }
+
+    #[test]
+    fn legacy_profile_rpc_migrates_to_secondary_node() {
+        let mut cfg = StackConfig::default();
+        cfg.groups[0].profiles[0].single.use_rpc = true;
+        cfg.groups[0].profiles[0].single.rpc_endpoint = "192.168.0.245:50052".to_string();
+        cfg.migrate_legacy_rpc_to_secondary_node();
+
+        assert!(cfg.secondary_node.enabled);
+        assert_eq!(cfg.secondary_node.host, "192.168.0.245");
+        assert_eq!(cfg.secondary_node.rpc_port, 50052);
+        assert_eq!(cfg.secondary_node.rpc_fallback, RpcFallbackPolicy::Auto);
+    }
+
+    #[test]
+    fn routing_set_yaml_honors_auto_rpc_fallback() {
+        let mut cfg = StackConfig::default();
+        cfg.secondary_node.enabled = true;
+        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.rpc_port = 50052;
+        cfg.secondary_node.rpc_fallback = RpcFallbackPolicy::Auto;
+        cfg.groups[0].profiles[0].single.use_rpc = true;
+
+        let set = cfg.routing_sets[0].clone();
+        let yaml_up = cfg.build_routing_set_yaml_with_rpc_status(&set, Some(true));
+        let yaml_down = cfg.build_routing_set_yaml_with_rpc_status(&set, Some(false));
+
+        assert!(yaml_up.contains("--rpc 192.168.0.245:50052 --cache-ram 0"));
+        assert!(!yaml_down.contains("--rpc"));
+    }
 }

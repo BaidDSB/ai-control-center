@@ -75,4 +75,13 @@ mod tests {
         assert_eq!(buf.total_lines, (MAX_CONSOLE_LINES + 5) as u64);
         assert_eq!(buf.lines.front().map(String::as_str), Some("line-5"));
     }
+
+    #[test]
+    fn probe_tcp_endpoint_detects_live_and_closed_ports() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
+        let addr = listener.local_addr().expect("local addr").to_string();
+        assert!(probe_tcp_endpoint(&addr, 120));
+        drop(listener);
+        assert!(!probe_tcp_endpoint(&addr, 120));
+    }
 }

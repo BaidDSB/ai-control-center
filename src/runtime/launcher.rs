@@ -1,7 +1,86 @@
 use std::sync::Arc;
 use super::console::{SharedConsole, SharedErrors, UiNotifier, UiNotifyTarget, spawn_pipe_reader};
-use super::state::{TrackedMeta, TrackedProc, TrackedSlot, active_backend_info, clear_tracked_if_pid, normalize_probe_host, record_tracked, stop_tracked_backend, stop_tracked_frontend, stop_tracked_mcpo, wait_for_port_release};
-use crate::config::{ModelProfile, RoutingSet, StackConfig};
+use super::state::{
+    active_backend_info, clear_tracked_if_pid, normalize_probe_host, probe_tcp_endpoint,
+    record_tracked, stop_tracked_backend, stop_tracked_frontend, stop_tracked_mcpo,
+    wait_for_port_release, TrackedMeta, TrackedProc, TrackedSlot, RPC_PROBE_TIMEOUT_MS,
+};
+use crate::config::{ModelProfile, RoutingSet, RpcFallbackPolicy, StackConfig};
+
+fn resolve_profile_rpc_for_launch(
+    cfg: &StackConfig,
+    profile: &ModelProfile,
+) -> (Option<String>, Option<String>) {
+    if !profile.single.use_rpc {
+        return (None, None);
+    }
+    let Some(ep) = cfg.effective_rpc_for_profile(&profile.single, None) else {
+        return (
+            None,
+            Some("[RPC] Profile has RPC ON, but Secondary Node is disabled/empty — running locally.".to_string()),
+        );
+    };
+    match cfg.secondary_node.rpc_fallback {
+        RpcFallbackPolicy::Strict => (
+            Some(ep.clone()),
+            Some(format!("[RPC] Strict policy -> pooling remote GPU at {ep}")),
+        ),
+        RpcFallbackPolicy::Auto => {
+            if probe_tcp_endpoint(&ep, RPC_PROBE_TIMEOUT_MS) {
+                (
+                    Some(ep.clone()),
+                    Some(format!("[RPC] Auto probe OK ({ep}) -> pooling remote GPU VRAM")),
+                )
+            } else {
+                (
+                    None,
+                    Some(format!(
+                        "[RPC] Secondary node {ep} unreachable ({RPC_PROBE_TIMEOUT_MS}ms probe) — Auto zero-wait fallback to local GPU/RAM."
+                    )),
+                )
+            }
+        }
+    }
+}
+
+fn resolve_set_rpc_for_launch(
+    cfg: &StackConfig,
+    linked: &[&ModelProfile],
+) -> (Option<bool>, Option<String>) {
+    let first_ep = linked
+        .iter()
+        .find_map(|p| cfg.effective_rpc_for_profile(&p.single, None));
+    let Some(ep) = first_ep else {
+        if linked.iter().any(|p| p.single.use_rpc) {
+            return (
+                Some(false),
+                Some("[RPC] RPC-enabled profile(s) in set, but Secondary Node is disabled/empty — running locally.".to_string()),
+            );
+        }
+        return (None, None);
+    };
+    match cfg.secondary_node.rpc_fallback {
+        RpcFallbackPolicy::Strict => (
+            Some(true),
+            Some(format!("[RPC] Strict policy -> pooling remote GPU at {ep}")),
+        ),
+        RpcFallbackPolicy::Auto => {
+            if probe_tcp_endpoint(&ep, RPC_PROBE_TIMEOUT_MS) {
+                (
+                    Some(true),
+                    Some(format!("[RPC] Auto probe OK ({ep}) -> RPC enabled for marked profiles")),
+                )
+            } else {
+                (
+                    Some(false),
+                    Some(format!(
+                        "[RPC] Secondary node {ep} unreachable ({RPC_PROBE_TIMEOUT_MS}ms probe) — Auto zero-wait fallback to local GPU/RAM."
+                    )),
+                )
+            }
+        }
+    }
+}
 use crate::platform::{self, CommandExtPlatform};
 use std::fs;
 use std::path::Path;
@@ -24,17 +103,27 @@ pub fn sync_live_llama_swap_yaml(cfg: &StackConfig) -> Result<bool, String> {
     if set.mode != "llama_swap" || set.profile_ids.is_empty() {
         return Ok(false);
     }
+    let mut linked: Vec<&ModelProfile> = Vec::new();
     for pid in &set.profile_ids {
         let Some(p) = cfg.find_profile(pid) else {
             return Err(format!("linked profile '{pid}' missing"));
         };
-        let (cmd_check, _) =
-            p.build_swap_cmd_and_env_with_engines(&cfg.models_dir, &cfg.llama_dir, &cfg.saved_engines);
+        linked.push(p);
+    }
+    let (rpc_reachable, _) = resolve_set_rpc_for_launch(cfg, &linked);
+    for p in &linked {
+        let resolved_rpc = cfg.effective_rpc_for_profile(&p.single, rpc_reachable);
+        let (cmd_check, _) = p.build_swap_cmd_and_env_with_engines_and_rpc(
+            &cfg.models_dir,
+            &cfg.llama_dir,
+            &cfg.saved_engines,
+            resolved_rpc.as_deref(),
+        );
         if !cmd_check.contains("${PORT}") {
             return Err(format!("profile '{}' is missing {{port}}/{{addr}}", p.name));
         }
     }
-    let yaml = cfg.build_routing_set_yaml(set);
+    let yaml = cfg.build_routing_set_yaml_with_rpc_status(set, rpc_reachable);
     fs::write(cfg.resolved_llama_swap_yaml_path(), yaml)
         .map_err(|e| format!("failed writing llama-swap.yaml: {e}"))?;
     Ok(true)
@@ -222,9 +311,13 @@ pub fn launch_single_profile(
         ));
     }
 
-    let args = profile.build_llama_args(&cfg.models_dir);
+    let (resolved_rpc, rpc_note) = resolve_profile_rpc_for_launch(cfg, profile);
+    let args = profile.build_llama_args_with_rpc(&cfg.models_dir, resolved_rpc.as_deref());
     let disable_pinned = profile.should_disable_cuda_pinned();
     let mut headers = vec![format!("[ENGINE] {engine_kind} -> {}", exe.display())];
+    if let Some(note) = rpc_note {
+        headers.push(note);
+    }
     let mut envs: Vec<(&str, &str)> = Vec::new();
     if disable_pinned {
         headers.push("[ENV] GGML_CUDA_NO_PINNED=1".to_string());
@@ -326,7 +419,8 @@ pub fn launch_routing_set(
                 exe.display()
             ));
         }
-        let ini = cfg.build_routing_set_ini(set);
+        let (rpc_reachable, rpc_note) = resolve_set_rpc_for_launch(cfg, &linked);
+        let ini = cfg.build_routing_set_ini_with_rpc_status(set, rpc_reachable);
         fs::write(cfg.resolved_router_ini_path(), ini)
             .map_err(|e| format!("Failed writing models.ini: {e}"))?;
 
@@ -350,14 +444,15 @@ pub fn launch_routing_set(
         if disable_pinned {
             envs.push(("GGML_CUDA_NO_PINNED", "1"));
         }
-        let headers = vec![
-            format!(
-                "[ROUTING SET (models.ini)] {} ({} models)",
-                set.name,
-                linked.len()
-            ),
-            format!("[LAUNCH] {engine_exe} {}", args.join(" ")),
-        ];
+        let mut headers = vec![format!(
+            "[ROUTING SET (models.ini)] {} ({} models)",
+            set.name,
+            linked.len()
+        )];
+        if let Some(note) = rpc_note {
+            headers.push(note);
+        }
+        headers.push(format!("[LAUNCH] {engine_exe} {}", args.join(" ")));
         return spawn_monitored(
             &exe,
             Path::new(engine_dir),
@@ -384,9 +479,15 @@ pub fn launch_routing_set(
     if !swap_exe.exists() {
         return Err(format!("{swap_name} not found at {}", swap_exe.display()));
     }
+    let (rpc_reachable, rpc_note) = resolve_set_rpc_for_launch(cfg, &linked);
     for p in &linked {
-        let (cmd_check, _) =
-            p.build_swap_cmd_and_env_with_engines(&cfg.models_dir, &cfg.llama_dir, &cfg.saved_engines);
+        let resolved_rpc = cfg.effective_rpc_for_profile(&p.single, rpc_reachable);
+        let (cmd_check, _) = p.build_swap_cmd_and_env_with_engines_and_rpc(
+            &cfg.models_dir,
+            &cfg.llama_dir,
+            &cfg.saved_engines,
+            resolved_rpc.as_deref(),
+        );
         if !cmd_check.contains("${PORT}") {
             return Err(format!(
                 "Profile '{}' uses a custom engine with no launch flags. Set Custom Flags on the profile (or Default Args on the engine) including {{model}} and {{port}}/{{addr}} (e.g. serve --model {{model}} --ctx {{ctx}} --addr {{addr}}).",
@@ -394,7 +495,7 @@ pub fn launch_routing_set(
             ));
         }
     }
-    let yaml = cfg.build_routing_set_yaml(set);
+    let yaml = cfg.build_routing_set_yaml_with_rpc_status(set, rpc_reachable);
     fs::write(cfg.resolved_llama_swap_yaml_path(), yaml)
         .map_err(|e| format!("Failed writing llama-swap.yaml: {e}"))?;
 
@@ -407,15 +508,16 @@ pub fn launch_routing_set(
         "-watch-config".to_string(),
     ];
     let work_dir = swap_exe.parent().unwrap_or_else(|| Path::new("."));
-    let headers = vec![
-        format!(
-            "[ROUTING SET (llama-swap)] {} ({} models on http://{}/v1)",
-            set.name,
-            linked.len(),
-            listen
-        ),
-        format!("[LAUNCH] {swap_name} {}", args.join(" ")),
-    ];
+    let mut headers = vec![format!(
+        "[ROUTING SET (llama-swap)] {} ({} models on http://{}/v1)",
+        set.name,
+        linked.len(),
+        listen
+    )];
+    if let Some(note) = rpc_note {
+        headers.push(note);
+    }
+    headers.push(format!("[LAUNCH] {swap_name} {}", args.join(" ")));
     spawn_monitored(
         swap_exe,
         work_dir,
