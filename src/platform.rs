@@ -437,3 +437,218 @@ impl CommandExtPlatform for Command {
         self
     }
 }
+
+// =========================================================================
+// PID-Based Process Verification & Process-Tree Termination (v1.1)
+// =========================================================================
+
+pub fn prepare_managed_command(cmd: &mut std::process::Command) {
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        let _ = cmd;
+    }
+}
+
+pub fn exe_name_matches(actual: &str, expected: &str) -> bool {
+    let a = actual.trim().to_ascii_lowercase();
+    let e = expected.trim().to_ascii_lowercase();
+    if a.is_empty() || e.is_empty() {
+        return false;
+    }
+    if a == e {
+        return true;
+    }
+    let a_stem = a.strip_suffix(".exe").unwrap_or(&a);
+    let e_stem = e.strip_suffix(".exe").unwrap_or(&e);
+    if a_stem == e_stem {
+        return true;
+    }
+    #[cfg(not(windows))]
+    if a.len() == 15 && e.starts_with(&a) {
+        return true;
+    }
+    false
+}
+
+#[cfg(windows)]
+pub fn is_pid_running_as(pid: u32, expected_exe: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let filter = format!("PID eq {pid}");
+    let Ok(out) = std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .no_window()
+        .output()
+    else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with('"') {
+            continue;
+        }
+        let cols: Vec<&str> = trimmed
+            .trim_start_matches('"')
+            .trim_end_matches('"')
+            .split("\",\"")
+            .collect();
+        if cols.len() >= 2 && cols[1].trim().parse::<u32>().ok() == Some(pid) {
+            return exe_name_matches(cols[0], expected_exe);
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_pid_running_as(pid: u32, expected_exe: &str) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    let proc_dir = format!("/proc/{pid}");
+    if !std::path::Path::new(&proc_dir).exists() {
+        return false;
+    }
+    if let Ok(stat) = std::fs::read_to_string(format!("{proc_dir}/stat")) {
+        if let Some(after) = stat.rfind(')').map(|i| &stat[i + 1..]) {
+            if after.split_whitespace().next() == Some("Z") {
+                return false;
+            }
+        }
+    }
+    if let Ok(comm) = std::fs::read_to_string(format!("{proc_dir}/comm")) {
+        if exe_name_matches(&comm, expected_exe) {
+            return true;
+        }
+    }
+    if let Ok(raw) = std::fs::read(format!("{proc_dir}/cmdline")) {
+        for arg in raw.split(|&b| b == 0).take(2) {
+            if arg.is_empty() {
+                continue;
+            }
+            let s = String::from_utf8_lossy(arg);
+            if let Some(fname) = std::path::Path::new(s.as_ref())
+                .file_name()
+                .and_then(|n| n.to_str())
+            {
+                if exe_name_matches(fname, expected_exe) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+pub fn get_process_start_id(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
+    }
+    let script = format!(
+        "try {{ (Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks }} catch {{}}"
+    );
+    let Ok(out) = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .no_window()
+        .output()
+    else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[cfg(not(windows))]
+pub fn get_process_start_id(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
+    }
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return String::new();
+    };
+    let Some(after) = stat.rfind(')').map(|i| &stat[i + 1..]) else {
+        return String::new();
+    };
+    after
+        .split_whitespace()
+        .nth(19)
+        .unwrap_or_default()
+        .to_string()
+}
+
+pub fn verify_process_identity(pid: u32, expected_exe: &str, expected_start_id: &str) -> bool {
+    if !is_pid_running_as(pid, expected_exe) {
+        return false;
+    }
+    if !expected_start_id.trim().is_empty() {
+        let current = get_process_start_id(pid);
+        if current != expected_start_id.trim() {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(windows)]
+pub fn stop_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .no_window()
+        .output();
+}
+
+#[cfg(not(windows))]
+pub fn stop_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    let term_cmd = format!("kill -TERM -{pid} 2>/dev/null || kill -TERM {pid} 2>/dev/null");
+    let _ = std::process::Command::new("sh")
+        .args(["-c", &term_cmd])
+        .output();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+        let kill_cmd = format!("kill -KILL -{pid} 2>/dev/null || kill -KILL {pid} 2>/dev/null");
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &kill_cmd])
+            .output();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_name_matching_handles_case_and_extension() {
+        assert!(exe_name_matches("llama-server.exe", "llama-server.exe"));
+        assert!(exe_name_matches("LLAMA-SERVER.EXE", "llama-server"));
+        assert!(exe_name_matches("llama-swap", "llama-swap.exe"));
+        assert!(!exe_name_matches("llama-server.exe", "llama-swap.exe"));
+        assert!(!exe_name_matches("", "llama-server"));
+    }
+
+    #[test]
+    fn default_exe_name_matches_target_os() {
+        let name = default_exe_name("llama-server");
+        if cfg!(windows) {
+            assert_eq!(name, "llama-server.exe");
+        } else {
+            assert_eq!(name, "llama-server");
+        }
+    }
+
+    #[test]
+    fn zero_pid_never_verifies() {
+        assert!(!verify_process_identity(0, "llama-server", ""));
+    }
+}

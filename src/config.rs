@@ -1,4 +1,3 @@
-use eframe::egui;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
@@ -244,7 +243,14 @@ pub struct EnginePreset {
 
 impl EnginePreset {
     pub fn default_exe_for_kind(_kind: &str) -> &'static str {
-        "llama-server.exe"
+        #[cfg(windows)]
+        {
+            "llama-server.exe"
+        }
+        #[cfg(not(windows))]
+        {
+            "llama-server"
+        }
     }
 }
 
@@ -1182,37 +1188,49 @@ fn parse_cli_pairs(tokens: &[String]) -> (Vec<(String, String)>, HashMap<String,
     (ordered, map)
 }
 
-pub fn build_diff_layout_job(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffKind {
+    Unchanged,
+    Added,
+    Modified,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CliDiff {
+    pub exe_name: String,
+    pub env_pinned: Option<DiffKind>,
+    pub tokens: Vec<(String, DiffKind)>,
+    pub removed: Vec<String>,
+    pub change_count: usize,
+}
+
+pub fn compute_cli_diff(
     current: &ModelProfile,
     saved: &ModelProfile,
     models_dir: &str,
-) -> (egui::text::LayoutJob, Vec<String>, usize) {
-    use egui::{Color32, FontId, TextFormat};
-    let mut job = egui::text::LayoutJob::default();
-    let mut removed_items = Vec::new();
+) -> CliDiff {
+    let mut removed = Vec::new();
     let mut change_count = 0usize;
 
-    let white_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(230, 234, 244), ..Default::default() };
-    let green_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(52, 211, 153), ..Default::default() };
-    let amber_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(251, 191, 36), ..Default::default() };
-    let dim_fmt = TextFormat { font_id: FontId::monospace(11.5), color: Color32::from_rgb(130, 138, 155), ..Default::default() };
-
-    if current.should_disable_cuda_pinned() {
-        let fmt = if !saved.should_disable_cuda_pinned() {
+    let env_pinned = if current.should_disable_cuda_pinned() {
+        if !saved.should_disable_cuda_pinned() {
             change_count += 1;
-            green_fmt.clone()
+            Some(DiffKind::Added)
         } else {
-            amber_fmt.clone()
-        };
-        job.append("[ENV: GGML_CUDA_NO_PINNED=1] ", 0.0, fmt);
-    } else if saved.should_disable_cuda_pinned() {
-        removed_items.push("GGML_CUDA_NO_PINNED=1".to_string());
-        change_count += 1;
-    }
+            Some(DiffKind::Modified)
+        }
+    } else {
+        if saved.should_disable_cuda_pinned() {
+            removed.push("GGML_CUDA_NO_PINNED=1".to_string());
+            change_count += 1;
+        }
+        None
+    };
 
     if current.engine_dir_override != saved.engine_dir_override
         || current.engine_kind != saved.engine_kind
         || current.engine_exe_override != saved.engine_exe_override
+        || current.use_manual_flags != saved.use_manual_flags
         || current.use_advanced_flags != saved.use_advanced_flags
     {
         change_count += 1;
@@ -1223,24 +1241,39 @@ pub fn build_diff_layout_job(
     let (cur_pairs, cur_map) = parse_cli_pairs(&cur_args);
     let (sav_pairs, sav_map) = parse_cli_pairs(&sav_args);
 
-    job.append(current.effective_engine_exe(), 0.0, dim_fmt);
+    let mut tokens = Vec::with_capacity(cur_pairs.len());
     for (k, v) in &cur_pairs {
-        job.append(" ", 0.0, white_fmt.clone());
         let pair_str = if v.is_empty() { k.clone() } else { format!("{k} {v}") };
         match sav_map.get(k) {
-            None => { job.append(&pair_str, 0.0, green_fmt.clone()); change_count += 1; }
-            Some(old_v) if old_v != v => { job.append(&pair_str, 0.0, amber_fmt.clone()); change_count += 1; }
-            Some(_) => { job.append(&pair_str, 0.0, white_fmt.clone()); }
+            None => {
+                tokens.push((pair_str, DiffKind::Added));
+                change_count += 1;
+            }
+            Some(old_v) if old_v != v => {
+                tokens.push((pair_str, DiffKind::Modified));
+                change_count += 1;
+            }
+            Some(_) => {
+                tokens.push((pair_str, DiffKind::Unchanged));
+            }
         }
     }
+
     for (k, v) in &sav_pairs {
         if !cur_map.contains_key(k) {
             let pair_str = if v.is_empty() { k.clone() } else { format!("{k} {v}") };
-            removed_items.push(pair_str);
+            removed.push(pair_str);
             change_count += 1;
         }
     }
-    (job, removed_items, change_count)
+
+    CliDiff {
+        exe_name: current.effective_engine_exe().to_string(),
+        env_pinned,
+        tokens,
+        removed,
+        change_count,
+    }
 }
 
 pub type HelpMap = HashMap<(String, String, String), String>;
@@ -1396,7 +1429,7 @@ impl StackConfig {
 
     pub fn build_routing_set_yaml(&self, set: &RoutingSet) -> String {
         let mut out = String::new();
-        out.push_str("# Auto-generated by AI Control Center v1.0\n");
+        out.push_str(&format!("# Auto-generated by AI Control Center v{}\n", env!("CARGO_PKG_VERSION")));
         out.push_str(&format!("# Routing Set: {}\n", set.name));
         out.push_str("healthCheckTimeout: 180\nlogToStdout: \"both\"\n\nmodels:\n");
 
@@ -1432,7 +1465,7 @@ impl StackConfig {
         for pid in &set.profile_ids {
             if let Some(prof) = self.find_profile(pid) {
                 if prof.effective_engine_kind() != "custom" {
-                    if prof.use_advanced_flags {
+                    if (prof.use_manual_flags && !prof.manual_flags.trim().is_empty()) || prof.use_advanced_flags {
                         let sec_name = prof.swap_model_id();
                         out.push_str(&format!("[{sec_name}]\n"));
                         let toks = prof.build_args_with_port(&self.models_dir, "8080");
@@ -1851,4 +1884,166 @@ pub fn scan_gguf_models(root: &str) -> Vec<String> {
     }
     found.sort();
     found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_gguf_str(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    #[test]
+    fn default_exe_for_kind_matches_target_os() {
+        let exe = EnginePreset::default_exe_for_kind("llama_cpp");
+        if cfg!(windows) {
+            assert_eq!(exe, "llama-server.exe");
+        } else {
+            assert_eq!(exe, "llama-server");
+        }
+    }
+
+    #[test]
+    fn cli_args_rewrite_port_and_handle_quoted_manual_flags() {
+        let mut prof = ModelProfile::default();
+        prof.use_manual_flags = true;
+        prof.manual_flags =
+            "-m {model} -c {ctx} --chat-template-file \"C:\\My Templates\\qwen.jinja\" --host {host} --port {port}"
+                .to_string();
+        prof.single.model_rel_path = "test-model.gguf".to_string();
+        prof.single.ctx_size = 32768;
+
+        let args = prof.build_args_with_port("D:\\Models", "${PORT}");
+        assert!(args.iter().any(|a| a == "${PORT}"));
+        assert!(args.iter().any(|a| a == "32768"));
+        assert!(args.iter().any(|a| a.contains("My Templates")));
+    }
+
+    #[test]
+    fn compute_cli_diff_detects_env_flag_and_manual_mode_changes() {
+        let saved = ModelProfile::default();
+        let mut current = saved.clone();
+
+        let clean = compute_cli_diff(&current, &saved, "D:\\Models");
+        assert_eq!(clean.change_count, 0);
+        assert!(clean.removed.is_empty());
+
+        current.single.ctx_size = saved.single.ctx_size + 8192;
+        current.single.disable_cuda_pinned = true;
+        current.use_manual_flags = true;
+        let changed = compute_cli_diff(&current, &saved, "D:\\Models");
+        assert!(changed.change_count >= 2);
+        assert_eq!(changed.env_pinned, Some(DiffKind::Added));
+    }
+
+    #[test]
+    fn routing_set_yaml_uses_cargo_version_and_swap_port() {
+        let cfg = StackConfig::default();
+        let set = cfg.routing_sets[0].clone();
+        let yaml = cfg.build_routing_set_yaml(&set);
+
+        let expected_banner = format!(
+            "# Auto-generated by AI Control Center v{}",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(yaml.contains(&expected_banner));
+        assert!(yaml.contains("models:"));
+        assert!(yaml.contains("${PORT}"));
+    }
+
+    #[test]
+    fn routing_set_ini_respects_use_manual_flags() {
+        let mut cfg = StackConfig::default();
+        let pid = cfg.groups[0].profiles[0].id.clone();
+        {
+            let prof = &mut cfg.groups[0].profiles[0];
+            prof.use_manual_flags = true;
+            prof.use_advanced_flags = false;
+            prof.manual_flags = "-m {model} -c 65536 --host {host} --port {port}".to_string();
+        }
+        let set = RoutingSet {
+            id: "ini-test".to_string(),
+            name: "INI Test".to_string(),
+            description: String::new(),
+            mode: "llama_ini".to_string(),
+            no_models_autoload: false,
+            profile_ids: vec![pid],
+        };
+
+        let ini = cfg.build_routing_set_ini(&set);
+        assert!(ini.contains("65536"));
+        assert!(!ini.contains("--port"));
+    }
+
+    #[test]
+    fn help_markdown_parser_extracts_model_sections() {
+        assert!(parse_help_markdown_str("Plain text without tags").is_empty());
+
+        let md = "<!-- @model: demo-model -->\nUse flash attention for speed.\n";
+        let map = parse_help_markdown_str(md);
+        let note = map
+            .get(&(
+                "demo-model".to_string(),
+                "general".to_string(),
+                String::new(),
+            ))
+            .expect("expected parsed demo-model general note");
+        assert!(note.contains("Use flash attention for speed."));
+    }
+
+    #[test]
+    fn probe_gguf_header_handles_valid_bad_magic_and_truncated_files() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "acc_gguf_test_{}",
+            std::process::id()
+        ));
+        let _ = fs::create_dir_all(&tmp_dir);
+        let dir_str = tmp_dir.to_string_lossy().to_string();
+
+        // 1. Minimal valid GGUF v3 header (arch = qwen2, 40 layers, 131072 ctx)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3u32.to_le_bytes()); // version
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&3u64.to_le_bytes()); // metadata_kv_count
+
+        write_gguf_str(&mut bytes, "general.architecture");
+        bytes.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING
+        write_gguf_str(&mut bytes, "qwen2");
+
+        write_gguf_str(&mut bytes, "qwen2.block_count");
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // GGUF_TYPE_UINT32
+        bytes.extend_from_slice(&40u32.to_le_bytes());
+
+        write_gguf_str(&mut bytes, "qwen2.context_length");
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // GGUF_TYPE_UINT32
+        bytes.extend_from_slice(&131072u32.to_le_bytes());
+
+        let valid_path = tmp_dir.join("valid.gguf");
+        fs::write(&valid_path, &bytes).expect("write valid gguf");
+        let valid_info = probe_gguf_header(&dir_str, "valid.gguf");
+        assert!(valid_info.valid);
+        assert_eq!(valid_info.arch, "qwen2");
+        assert_eq!(valid_info.block_count, Some(40));
+        assert_eq!(valid_info.context_length, Some(131072));
+
+        // 2. Bad magic
+        let bad_path = tmp_dir.join("bad.gguf");
+        fs::write(&bad_path, b"NOT_A_GGUF_HEADER_AT_ALL").expect("write bad gguf");
+        assert!(!probe_gguf_header(&dir_str, "bad.gguf").valid);
+
+        // 3. Truncated header
+        let trunc_path = tmp_dir.join("trunc.gguf");
+        fs::write(&trunc_path, b"GGUF\x03").expect("write trunc gguf");
+        assert!(!probe_gguf_header(&dir_str, "trunc.gguf").valid);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn slugify_normalizes_spaces_and_case() {
+        assert_eq!(slugify("My Test Set 1"), "my-test-set-1");
+    }
 }
