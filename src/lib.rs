@@ -1,7 +1,7 @@
-pub mod app;
 pub mod config;
 pub mod platform;
 pub mod runtime;
+pub mod ui;
 
 use config::StackConfig;
 
@@ -48,4 +48,6 @@ impl AppPatch {
             .unwrap_or("127.0.0.1:50052")
     }
 }
-pub use app::run_app;
+
+pub use ui as app;
+pub use ui::run_app;
