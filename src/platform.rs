@@ -623,3 +623,32 @@ pub fn stop_process_tree(pid: u32) {
             .output();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exe_name_matching_handles_case_and_extension() {
+        assert!(exe_name_matches("llama-server.exe", "llama-server.exe"));
+        assert!(exe_name_matches("LLAMA-SERVER.EXE", "llama-server"));
+        assert!(exe_name_matches("llama-swap", "llama-swap.exe"));
+        assert!(!exe_name_matches("llama-server.exe", "llama-swap.exe"));
+        assert!(!exe_name_matches("", "llama-server"));
+    }
+
+    #[test]
+    fn default_exe_name_matches_target_os() {
+        let name = default_exe_name("llama-server");
+        if cfg!(windows) {
+            assert_eq!(name, "llama-server.exe");
+        } else {
+            assert_eq!(name, "llama-server");
+        }
+    }
+
+    #[test]
+    fn zero_pid_never_verifies() {
+        assert!(!verify_process_identity(0, "llama-server", ""));
+    }
+}

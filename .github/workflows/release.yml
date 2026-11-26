@@ -37,13 +37,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libgl1-mesa-dev
 
+      - name: Run unit tests (Core & Plus)
+        run: |
+          cargo test
+          cargo test --features plus
+
       - name: Build Core
         run: cargo build --release
 
       - name: Package Core
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.0}"
+          VERSION="${GITHUB_REF_NAME:-v1.1.0}"
           mkdir -p stage-core artifacts
           if [ "${{ runner.os }}" = "Linux" ]; then
             cp "target/release/ai-control-center" "stage-core/ai-control-center-core-${VERSION}"
@@ -60,7 +65,7 @@ jobs:
       - name: Package Plus
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.0}"
+          VERSION="${GITHUB_REF_NAME:-v1.1.0}"
           mkdir -p stage-plus artifacts
           cp help.example.md stage-plus/help.example.md
           if [ "${{ runner.os }}" = "Linux" ]; then
@@ -90,6 +95,12 @@ jobs:
         with:
           path: release-assets
           merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        working-directory: release-assets
+        run: |
+          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create Draft GitHub Release
         uses: softprops/action-gh-release@v3
