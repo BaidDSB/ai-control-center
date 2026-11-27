@@ -1,11 +1,11 @@
-use super::theme::{pasteable_singleline, pill_switch, plain_help_row, UiPalette};
+use super::theme::{file_dialog_in, pasteable_singleline, pill_switch, plain_help_row, UiPalette};
 use crate::config::{
     estimate_profile_vram, probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec,
     RpcFallbackPolicy,
 };
 use crate::runtime;
 use eframe::egui;
-use rfd::FileDialog;
+
 use std::collections::HashMap;
 
 fn hint_tag_colors(is_light: bool) -> (egui::Color32, egui::Color32, egui::Color32, egui::Color32) {
@@ -65,10 +65,9 @@ pub(crate) fn render_spec_inspector(
                 *scanned_models = scan_gguf_models(models_dir);
                 gguf_cache.clear();
             }
-            if ui.button("Pick...").clicked() {
-                if let Some(p) = FileDialog::new()
-                    .set_directory(models_dir)
-                    .add_filter("GGUF", &["gguf"])
+            if ui.button("Pick...").clicked()
+                && let Some(p) = file_dialog_in(models_dir)
+                    .add_filter("GGUF", &["gguf", "GGUF"])
                     .pick_file()
                 {
                     spec.model_rel_path = p
@@ -78,7 +77,6 @@ pub(crate) fn render_spec_inspector(
                     gguf_cache.remove(&format!("{models_dir}::{}", spec.model_rel_path));
                     *trigger_save_msg = Some(format!("Linked GGUF '{}'.", spec.model_rel_path));
                 }
-            }
         });
 
         ui.horizontal_wrapped(|ui| {
@@ -496,8 +494,8 @@ pub(crate) fn render_spec_inspector(
                 ui.label("Extra / Custom Flags:")
                     .on_hover_text("For llama_cpp: appended at the end. For custom engines (e.g. RustingStrata): used verbatim with {model}, {ctx}, {host}, {port}, {addr}.");
                 pasteable_singleline(ui, &mut spec.extra_args, 310.0, "Extra CLI flags or full custom engine command...");
-                if ui.button("Paste").clicked() {
-                    if let Some(clip) = runtime::read_from_clipboard() {
+                if ui.button("Paste").clicked()
+                    && let Some(clip) = runtime::read_from_clipboard() {
                         let cleaned = clip.replace(['\r', '\n'], " ");
                         let trimmed = cleaned.trim();
                         if !trimmed.is_empty() {
@@ -507,7 +505,6 @@ pub(crate) fn render_spec_inspector(
                             spec.extra_args.push_str(trimmed);
                         }
                     }
-                }
                 if !spec.extra_args.is_empty() && ui.button("Clear").clicked() {
                     spec.extra_args.clear();
                 }
@@ -604,10 +601,9 @@ pub(crate) fn render_advanced_inspector(
                 *scanned_models = scan_gguf_models(models_dir);
                 gguf_cache.clear();
             }
-            if ui.button("Pick...").clicked() {
-                if let Some(p) = FileDialog::new()
-                    .set_directory(models_dir)
-                    .add_filter("GGUF", &["gguf"])
+            if ui.button("Pick...").clicked()
+                && let Some(p) = file_dialog_in(models_dir)
+                    .add_filter("GGUF", &["gguf", "GGUF"])
                     .pick_file()
                 {
                     prof.single.model_rel_path = p
@@ -617,7 +613,6 @@ pub(crate) fn render_advanced_inspector(
                     gguf_cache.remove(&format!("{models_dir}::{}", prof.single.model_rel_path));
                     *trigger_save_msg = Some(format!("Linked GGUF '{}'.", prof.single.model_rel_path));
                 }
-            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut prof.single.use_alias, "OWU Alias:");
@@ -669,8 +664,8 @@ pub(crate) fn render_advanced_inspector(
         {
             prof.manual_flags = prof.generate_manual_template();
         }
-        if ui.button("Paste").on_hover_text("Paste flags from clipboard.").clicked() {
-            if let Some(clip) = runtime::read_from_clipboard() {
+        if ui.button("Paste").on_hover_text("Paste flags from clipboard.").clicked()
+            && let Some(clip) = runtime::read_from_clipboard() {
                 let cleaned = clip.replace(['\r', '\n'], " ");
                 let trimmed = cleaned.trim();
                 if !trimmed.is_empty() {
@@ -680,7 +675,6 @@ pub(crate) fn render_advanced_inspector(
                     prof.manual_flags.push_str(trimmed);
                 }
             }
-        }
         if !prof.manual_flags.is_empty() && ui.button("Clear").clicked() {
             prof.manual_flags.clear();
         }

@@ -595,6 +595,8 @@ pub struct StackConfig {
     #[serde(default)]
     pub use_external_cmd_windows: bool,
     #[serde(default)]
+    pub minimize_to_tray: bool,
+    #[serde(default)]
     pub selected_set_idx: usize,
     #[serde(default)]
     pub selected_group_idx: usize,
@@ -769,13 +771,12 @@ impl StackConfig {
                 break;
             }
         }
-        if let Some(ep) = preferred_ep.or(fallback_ep) {
-            if let Some((host, port)) = SecondaryNodeConfig::parse_host_port(&ep) {
+        if let Some(ep) = preferred_ep.or(fallback_ep)
+            && let Some((host, port)) = SecondaryNodeConfig::parse_host_port(&ep) {
                 self.secondary_node.enabled = true;
                 self.secondary_node.host = host;
                 self.secondary_node.rpc_port = port;
             }
-        }
     }
 
     pub fn effective_rpc_for_profile(
@@ -814,11 +815,10 @@ impl StackConfig {
             let Some(prof) = self.find_profile(pid) else {
                 continue;
             };
-            if let Some(ep) = self.effective_rpc_for_profile(&prof.single, None) {
-                if let Some(h) = extract_normalized_host(&ep) {
+            if let Some(ep) = self.effective_rpc_for_profile(&prof.single, None)
+                && let Some(h) = extract_normalized_host(&ep) {
                     rpc_hosts.push((prof.name.clone(), h));
                 }
-            }
         }
         if rpc_hosts.is_empty() {
             return Vec::new();
@@ -854,7 +854,7 @@ impl StackConfig {
 
     pub fn load_with_hooks(
         default_fn: Option<fn() -> StackConfig>,
-        migrator_fn: Option<fn(&str) -> Result<StackConfig, String>>,
+        migrator_fn: Option<LegacyMigratorFn>,
         post_load_fn: Option<fn(&mut StackConfig)>,
     ) -> Self {
         let v3_path = Self::config_path();
@@ -977,6 +977,7 @@ impl Default for StackConfig {
             mcpo_port: 8000,
             mcpo_url: String::new(),
             use_external_cmd_windows: false,
+            minimize_to_tray: false,
             selected_set_idx: 0,
             selected_group_idx: 0,
             selected_profile_idx: 0,
@@ -1131,4 +1132,88 @@ fn migrate_from_v2(raw: &str) -> Result<StackConfig, String> {
         cfg.groups = migrated_groups;
     }
     Ok(cfg)
+}
+
+pub type LegacyMigratorFn = fn(&str) -> Result<StackConfig, String>;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PortableProfileBundle {
+    #[serde(default = "default_bundle_version")]
+    pub format_version: u32,
+    #[serde(default)]
+    pub model_filename_hint: String,
+    pub profile: ModelProfile,
+}
+
+fn default_bundle_version() -> u32 {
+    1
+}
+
+fn file_basename_only(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
+impl ModelProfile {
+    /// Returns a shareable copy with machine-local folders and LAN endpoints stripped.
+    pub fn to_portable_bundle(&self) -> PortableProfileBundle {
+        let mut clean = self.clone();
+        clean.engine_dir_override.clear();
+        let model_hint = file_basename_only(&clean.single.model_rel_path);
+        clean.single.model_rel_path = model_hint.clone();
+        clean.single.mtp_draft_model_rel = file_basename_only(&clean.single.mtp_draft_model_rel);
+        clean.single.rpc_endpoint.clear();
+        PortableProfileBundle {
+            format_version: 1,
+            model_filename_hint: model_hint,
+            profile: clean,
+        }
+    }
+
+    pub fn to_portable_toml(&self) -> Result<String, String> {
+        toml::to_string_pretty(&self.to_portable_bundle()).map_err(|e| e.to_string())
+    }
+
+    pub fn from_portable_toml(raw: &str, scanned_models: &[String]) -> Result<ModelProfile, String> {
+        let bundle: PortableProfileBundle =
+            toml::from_str(raw).map_err(|e| format!("Invalid profile TOML: {e}"))?;
+        let mut prof = bundle.profile;
+        prof.engine_dir_override.clear();
+        prof.single.rpc_endpoint.clear();
+
+        let hint = if !bundle.model_filename_hint.trim().is_empty() {
+            file_basename_only(&bundle.model_filename_hint)
+        } else {
+            file_basename_only(&prof.single.model_rel_path)
+        };
+        if !hint.is_empty() {
+            let matched = scanned_models.iter().find(|m| {
+                file_basename_only(m).eq_ignore_ascii_case(&hint)
+            });
+            prof.single.model_rel_path = matched.cloned().unwrap_or(hint);
+        }
+        Ok(prof)
+    }
+}
+
+pub fn profile_matches_search(group_title: &str, group_subtitle: &str, prof: &ModelProfile, query: &str) -> bool {
+    let q = query.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return true;
+    }
+    group_title.to_ascii_lowercase().contains(&q)
+        || group_subtitle.to_ascii_lowercase().contains(&q)
+        || prof.name.to_ascii_lowercase().contains(&q)
+        || prof.role_tag.to_ascii_lowercase().contains(&q)
+        || prof.single.alias.to_ascii_lowercase().contains(&q)
+        || prof.single.model_rel_path.to_ascii_lowercase().contains(&q)
+        || prof.engine_badge_name().to_ascii_lowercase().contains(&q)
 }

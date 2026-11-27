@@ -4,7 +4,8 @@ mod header;
 mod inspector;
 mod setup;
 mod sidebar;
-mod theme;
+pub(crate) mod theme;
+mod tray;
 
 use crate::config::{
     parse_help_markdown, parse_help_markdown_str, scan_gguf_models, GgufInfo, HelpMap, StackConfig,
@@ -15,7 +16,7 @@ use console::{console_notifier, llama_vp_id, owu_vp_id, render_console_viewport}
 use drawer::{render_right_drawer, CodePreviewScope, RightDrawerTab};
 use eframe::egui;
 use inspector::{render_advanced_inspector, render_spec_inspector};
-use rfd::FileDialog;
+
 use runtime::{
     active_backend_info, init_running_state, launch_routing_set,
     launch_single_profile, poll_tracked_processes, stop_tracked_backend,
@@ -24,15 +25,15 @@ use runtime::{
 use sidebar::{render_left_workspace, SidebarDrafts};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use theme::{
-    apply_app_theme, contrast_on, engine_badge_color_for, palette_for, pasteable_singleline,
-    themed_card,
+    apply_app_theme, contrast_on, engine_badge_color_for, file_dialog_in, palette_for,
+    pasteable_singleline, themed_card,
 };
+use tray::{TrayAction, TrayController};
 
 fn load_window_icon(icon_path: &str, embedded: Option<&[u8]>) -> Option<egui::IconData> {
     let bytes = fs::read(icon_path.trim())
@@ -77,6 +78,8 @@ struct ControlCenterApp {
     edit_mode: bool,
     applied_theme_sig: (ThemeMode, [u8; 3], bool),
     status_msg: String,
+    tray: TrayController,
+    allow_close: bool,
 }
 
 impl ControlCenterApp {
@@ -98,14 +101,12 @@ impl ControlCenterApp {
             patch.legacy_migrator_fn,
             patch.post_load_fn,
         );
-        if cfg.secondary_node.host.trim().is_empty() {
-            if let Some(ep) = patch.default_rpc_endpoint.as_deref() {
-                if let Some((host, port)) = crate::config::SecondaryNodeConfig::parse_host_port(ep) {
+        if cfg.secondary_node.host.trim().is_empty()
+            && let Some(ep) = patch.default_rpc_endpoint.as_deref()
+                && let Some((host, port)) = crate::config::SecondaryNodeConfig::parse_host_port(ep) {
                     cfg.secondary_node.host = host;
                     cfg.secondary_node.rpc_port = port;
                 }
-            }
-        }
         let saved_cfg = cfg.clone();
         let scanned_models = scan_gguf_models(&cfg.models_dir);
         let help_map = Self::load_help_with_fallback(&cfg.help_md_path, patch.embedded_help_md);
@@ -161,6 +162,12 @@ impl ControlCenterApp {
          "{} Ready — pick a Routing Set on top, or browse Model Families -> Sub-Profiles below.",
          patch.effective_version()
      );
+     let tray_tip = format!(
+         "{} {}",
+         effective_app_title(&cfg, &patch),
+         patch.effective_version()
+     );
+     let tray = TrayController::start(ctx.clone(), tray_tip);
      Self {
          patch,
          cfg,
@@ -189,6 +196,8 @@ impl ControlCenterApp {
          edit_mode: false,
          applied_theme_sig: sig,
          status_msg: ready_msg,
+         tray,
+         allow_close: false,
      }
  }
 
@@ -304,6 +313,62 @@ impl eframe::App for ControlCenterApp {
         let mut procs = self.current_procs();
         if !procs.llama {
             self.loaded_label = None;
+        }
+
+        // SYSTEM TRAY ACTIONS & CLOSE-TO-TRAY INTERCEPT
+        for action in self.tray.poll_actions() {
+            match action {
+                TrayAction::Show => {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::OpenBrowser => {
+                    platform::open_url(&self.cfg.effective_frontend_url());
+                }
+                TrayAction::SoftUnload => {
+                    match runtime::soft_unload_llama_swap(&self.cfg.server_host, self.cfg.server_port) {
+                        Ok(()) => {
+                            if let Ok(mut g) = self.shared_telemetry.lock() {
+                                g.running_models.clear();
+                            }
+                            self.status_msg = "Sent Soft Unload via tray — VRAM freeing.".to_string();
+                        }
+                        Err(e) => self.push_error(format!("Tray Soft Unload failed: {e}")),
+                    }
+                }
+                TrayAction::StopAll => {
+                    stop_tracked_backend();
+                    runtime::stop_tracked_frontend();
+                    runtime::stop_tracked_mcpo();
+                    if cfg!(feature = "plus") {
+                        for (ci, svc) in self.cfg.companion_services.iter().enumerate() {
+                            if svc.enabled
+                                && ci < procs.companion_running.len()
+                                && procs.companion_running[ci]
+                            {
+                                let _ = runtime::stop_companion_service(svc);
+                            }
+                        }
+                    }
+                    self.loaded_label = None;
+                    procs = ProcStatus::default();
+                    self.set_procs(procs);
+                    self.status_msg = "Stopped all services via tray.".to_string();
+                }
+                TrayAction::Quit => {
+                    self.allow_close = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if self.cfg.minimize_to_tray
+            && !self.allow_close
+            && self.tray.is_active()
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
         let err_count = self.error_logs.lock().map(|l| l.len()).unwrap_or(0);
@@ -577,6 +642,36 @@ impl eframe::App for ControlCenterApp {
                                         {
                                             revert_requested = true;
                                         }
+                                        if ui
+                                            .add(egui::Button::new("Export").min_size(egui::vec2(64.0, 32.0)))
+                                            .on_hover_text("Export this sub-profile as a path-stripped portable .toml file")
+                                            .clicked()
+                                            && let Some(prof) = self
+                                                .cfg
+                                                .groups
+                                                .get(g_idx)
+                                                .and_then(|g| g.profiles.get(p_idx))
+                                        {
+                                            let default_name = format!("{}.toml", crate::config::slugify(&prof.name));
+                                            if let Some(save_path) = file_dialog_in("")
+                                                .set_file_name(&default_name)
+                                                .add_filter("Profile TOML", &["toml"])
+                                                .save_file()
+                                            {
+                                                match prof.to_portable_toml() {
+                                                    Ok(toml_body) => match fs::write(&save_path, toml_body) {
+                                                        Ok(()) => {
+                                                            self.status_msg = format!(
+                                                                "Exported portable profile to {}",
+                                                                save_path.display()
+                                                            );
+                                                        }
+                                                        Err(e) => self.push_error(format!("Export write failed: {e}")),
+                                                    },
+                                                    Err(e) => self.push_error(format!("Export serialize failed: {e}")),
+                                                }
+                                            }
+                                        }
                                         if has_unsaved {
                                             ui.label(
                                                 egui::RichText::new("Unsaved / Temp")
@@ -696,12 +791,9 @@ impl eframe::App for ControlCenterApp {
                                                                 } else {
                                                                     prof.engine_dir_override.as_str()
                                                                 };
-                                                                let mut dlg = FileDialog::new();
+                                                                let mut dlg = file_dialog_in(start_dir);
                                                                 if cfg!(windows) {
                                                                     dlg = dlg.add_filter("Executable", &["exe"]);
-                                                                }
-                                                                if Path::new(start_dir).exists() {
-                                                                    dlg = dlg.set_directory(start_dir);
                                                                 }
                                                                 if let Some(p) = dlg.pick_file() {
                                                                     if let Some(par) = p.parent() {
@@ -710,11 +802,10 @@ impl eframe::App for ControlCenterApp {
                                                                     if let Some(fname) = p.file_name() {
                                                                         prof.engine_exe_override = fname.to_string_lossy().to_string();
                                                                     }
-                                                                    if prof.engine_label.trim().is_empty() {
-                                                                        if let Some(stem) = p.file_stem() {
+                                                                    if prof.engine_label.trim().is_empty()
+                                                                        && let Some(stem) = p.file_stem() {
                                                                             prof.engine_label = stem.to_string_lossy().to_string();
                                                                         }
-                                                                    }
                                                                     trigger_save_msg = Some("Bound custom engine executable to sub-profile.".to_string());
                                                                 }
                                                             }
@@ -959,11 +1050,10 @@ impl eframe::App for ControlCenterApp {
                             if ui.button("Close").clicked() {
                                 self.show_error_log = false;
                             }
-                            if ui.button("Clear Log").clicked() {
-                                if let Ok(mut l) = self.error_logs.lock() {
+                            if ui.button("Clear Log").clicked()
+                                && let Ok(mut l) = self.error_logs.lock() {
                                     l.clear();
                                 }
-                            }
                             if ui.button("Notepad").clicked() {
                                 runtime::open_text_in_notepad("error_log.txt", &full_log);
                             }

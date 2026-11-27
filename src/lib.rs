@@ -3,7 +3,7 @@ pub mod platform;
 pub mod runtime;
 pub mod ui;
 
-use config::StackConfig;
+use config::{LegacyMigratorFn, StackConfig};
 
 /// Overlay hook allowing a private crate (Tier 3: Personal) to inject defaults,
 /// branding, hardware hints, embedded fallback help.md, and custom icon bytes
@@ -16,7 +16,7 @@ pub struct AppPatch {
     pub default_rpc_endpoint: Option<String>,
     pub default_config_fn: Option<fn() -> StackConfig>,
     pub post_load_fn: Option<fn(&mut StackConfig)>,
-    pub legacy_migrator_fn: Option<fn(&str) -> Result<StackConfig, String>>,
+    pub legacy_migrator_fn: Option<LegacyMigratorFn>,
     pub embedded_help_md: Option<&'static str>,
     pub embedded_icon_bytes: Option<&'static [u8]>,
 }

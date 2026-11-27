@@ -10,6 +10,7 @@ pub use help::*;
 pub use schema::*;
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use std::fs;
@@ -399,5 +400,67 @@ mod tests {
         assert_eq!(on_ram.kv_cache_gb, 0.0);
         assert!(on_ram.total_ram_offload_gb >= on_gpu.kv_cache_gb - 0.01);
         assert!(on_ram.total_vram_gb < on_gpu.total_vram_gb);
+    }
+
+    #[test]
+    fn portable_profile_export_strips_local_paths_and_relinks_on_import() {
+        let mut prof = ModelProfile::default();
+        prof.name = "Qwen 35B Fast".to_string();
+        prof.engine_label = "llama.cpp".to_string();
+        prof.engine_dir_override = r"D:\Local LLM Setup\Engines\llama-b5000".to_string();
+        prof.single.model_rel_path = r"Qwen3\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf".to_string();
+        prof.single.mtp_draft_model_rel = r"Drafts\Qwen3-0.6B.gguf".to_string();
+        prof.single.rpc_endpoint = "192.168.0.245:50052".to_string();
+        prof.single.ctx_size = 131072;
+
+        let exported = prof.to_portable_toml().expect("export portable toml");
+        assert!(!exported.contains(r"D:\Local LLM Setup"));
+        assert!(!exported.contains("192.168.0.245"));
+        assert!(exported.contains("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"));
+
+        let scanned = vec![
+            "Other/Llama.gguf".to_string(),
+            "LocalDir/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf".to_string(),
+        ];
+        let imported = ModelProfile::from_portable_toml(&exported, &scanned).expect("import portable toml");
+        assert_eq!(imported.name, "Qwen 35B Fast");
+        assert_eq!(imported.single.ctx_size, 131072);
+        assert!(imported.engine_dir_override.is_empty());
+        assert!(imported.single.rpc_endpoint.is_empty());
+        assert_eq!(
+            imported.single.model_rel_path,
+            "LocalDir/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"
+        );
+    }
+
+    #[test]
+    fn portable_profile_import_rejects_corrupt_toml() {
+        assert!(ModelProfile::from_portable_toml("not = [valid", &[]).is_err());
+    }
+
+    #[test]
+    fn profile_search_matches_family_name_alias_engine_and_gguf() {
+        let mut prof = ModelProfile::default();
+        prof.name = "128K Coding".to_string();
+        prof.role_tag = "Code Agent".to_string();
+        prof.engine_label = "RustingStrata".to_string();
+        prof.single.alias = "qwen-coder-128k".to_string();
+        prof.single.model_rel_path = "Qwen/Qwen3-35B.gguf".to_string();
+
+        assert!(profile_matches_search("Qwen 3.6 Family", "MoE", &prof, ""));
+        assert!(profile_matches_search("Qwen 3.6 Family", "MoE", &prof, "moe"));
+        assert!(profile_matches_search("Qwen 3.6 Family", "MoE", &prof, "128k"));
+        assert!(profile_matches_search("Qwen 3.6 Family", "MoE", &prof, "rustingstrata"));
+        assert!(profile_matches_search("Qwen 3.6 Family", "MoE", &prof, "35b.gguf"));
+        assert!(!profile_matches_search("Qwen 3.6 Family", "MoE", &prof, "deepseek"));
+    }
+
+    #[test]
+    fn file_dialog_dir_guard_rejects_missing_or_blank_paths() {
+        assert!(crate::ui::theme::valid_dialog_dir("").is_none());
+        assert!(crate::ui::theme::valid_dialog_dir("   ").is_none());
+        assert!(crate::ui::theme::valid_dialog_dir("Z:\\definitely_missing_dir_99999").is_none());
+        let tmp = std::env::temp_dir();
+        assert!(crate::ui::theme::valid_dialog_dir(&tmp.to_string_lossy()).is_some());
     }
 }

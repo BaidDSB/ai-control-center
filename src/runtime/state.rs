@@ -105,12 +105,11 @@ pub fn init_running_state() -> RunningState {
     let mut changed = false;
 
     for slot in [&mut loaded.backend, &mut loaded.frontend, &mut loaded.mcpo] {
-        if let Some(tp) = slot.as_ref() {
-            if !platform::verify_process_identity(tp.pid, &tp.exe_name, &tp.start_id) {
+        if let Some(tp) = slot.as_ref()
+            && !platform::verify_process_identity(tp.pid, &tp.exe_name, &tp.start_id) {
                 *slot = None;
                 changed = true;
             }
-        }
     }
 
     if changed {
@@ -154,12 +153,11 @@ fn stop_tracked_slot(slot: TrackedSlot) -> bool {
         None
     };
 
-    if let Some(tp) = entry {
-        if platform::verify_process_identity(tp.pid, &tp.exe_name, &tp.start_id) {
+    if let Some(tp) = entry
+        && platform::verify_process_identity(tp.pid, &tp.exe_name, &tp.start_id) {
             platform::stop_process_tree(tp.pid);
             return true;
         }
-    }
     false
 }
 
@@ -193,30 +191,24 @@ pub fn poll_tracked_processes(companion_ports: &[u16]) -> ProcStatus {
 
     let mut pruned = false;
     if let Ok(mut guard) = state_lock().lock() {
-        if !backend_on {
-            if let Some(snap) = snapshot.backend.as_ref() {
-                if guard.backend.as_ref().map(|t| t.pid) == Some(snap.pid) {
+        if !backend_on
+            && let Some(snap) = snapshot.backend.as_ref()
+                && guard.backend.as_ref().map(|t| t.pid) == Some(snap.pid) {
                     guard.backend = None;
                     pruned = true;
                 }
-            }
-        }
-        if !frontend_on {
-            if let Some(snap) = snapshot.frontend.as_ref() {
-                if guard.frontend.as_ref().map(|t| t.pid) == Some(snap.pid) {
+        if !frontend_on
+            && let Some(snap) = snapshot.frontend.as_ref()
+                && guard.frontend.as_ref().map(|t| t.pid) == Some(snap.pid) {
                     guard.frontend = None;
                     pruned = true;
                 }
-            }
-        }
-        if !mcpo_on {
-            if let Some(snap) = snapshot.mcpo.as_ref() {
-                if guard.mcpo.as_ref().map(|t| t.pid) == Some(snap.pid) {
+        if !mcpo_on
+            && let Some(snap) = snapshot.mcpo.as_ref()
+                && guard.mcpo.as_ref().map(|t| t.pid) == Some(snap.pid) {
                     guard.mcpo = None;
                     pruned = true;
                 }
-            }
-        }
         if pruned {
             guard.save_to_disk();
         }

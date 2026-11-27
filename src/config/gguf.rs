@@ -141,8 +141,8 @@ fn skip_gguf_val<R: Read + Seek>(r: &mut R, vtype: u32) -> Option<()> {
     match vtype {
         0 | 1 | 7 => { r.seek(SeekFrom::Current(1)).ok()?; }
         2 | 3 => { r.seek(SeekFrom::Current(2)).ok()?; }
-        4 | 5 | 6 => { r.seek(SeekFrom::Current(4)).ok()?; }
-        10 | 11 | 12 => { r.seek(SeekFrom::Current(8)).ok()?; }
+        4..=6 => { r.seek(SeekFrom::Current(4)).ok()?; }
+        10..=12 => { r.seek(SeekFrom::Current(8)).ok()?; }
         8 => {
             let len = read_u64_le(r)? as i64;
             r.seek(SeekFrom::Current(len)).ok()?;
@@ -218,13 +218,11 @@ pub fn scan_gguf_models(root: &str) -> Vec<String> {
                 let p = entry.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if let Some(ext) = p.extension() {
-                    if ext.eq_ignore_ascii_case("gguf") {
-                        if let Ok(rel) = p.strip_prefix(base) {
+                } else if let Some(ext) = p.extension()
+                    && ext.eq_ignore_ascii_case("gguf")
+                        && let Ok(rel) = p.strip_prefix(base) {
                             found.push(rel.to_string_lossy().to_string());
                         }
-                    }
-                }
             }
         }
     }

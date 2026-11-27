@@ -1,12 +1,13 @@
 use super::sidebar::{SidebarDrafts, SidebarOutcome};
-use super::theme::{default_engine_rgb, pasteable_singleline, UiPalette, ENGINE_COLOR_PALETTE};
+use super::theme::{
+    default_engine_rgb, file_dialog_in, pasteable_singleline, UiPalette, ENGINE_COLOR_PALETTE,
+};
 use crate::config::{self, scan_gguf_models, EnginePreset, GgufInfo, RpcFallbackPolicy, StackConfig};
 use crate::runtime;
 use crate::platform;
 use eframe::egui;
 use rfd::FileDialog;
 use std::collections::HashMap;
-use std::path::Path;
 
 pub(crate) fn render_setup_card(
     ui: &mut egui::Ui,
@@ -57,20 +58,19 @@ pub(crate) fn render_setup_card(
                 ui.label("Global Engines Folder:");
                 ui.horizontal(|ui| {
                     pasteable_singleline(ui, &mut cfg.llama_dir, 185.0, "");
-                    if ui.button("...").clicked() {
-                        if let Some(p) = FileDialog::new().pick_folder() {
+                    if ui.button("...").clicked()
+                        && let Some(p) = FileDialog::new().pick_folder() {
                             cfg.llama_dir = p.to_string_lossy().to_string();
                             outcome.save_note = Some("Updated Global Engines folder.".to_string());
                         }
-                    }
                 });
 
                 if cfg!(feature = "plus") {
                     ui.label("External help.md:");
                     ui.horizontal(|ui| {
                         pasteable_singleline(ui, &mut cfg.help_md_path, 185.0, "");
-                        if ui.button("...").clicked() {
-                            if let Some(p) = FileDialog::new()
+                        if ui.button("...").clicked()
+                            && let Some(p) = FileDialog::new()
                                 .add_filter("Markdown", &["md", "txt"])
                                 .pick_file()
                             {
@@ -78,7 +78,6 @@ pub(crate) fn render_setup_card(
                                 outcome.reload_help = true;
                                 outcome.save_note = Some("Updated external help.md path.".to_string());
                             }
-                        }
                     });
                     ui.separator();
                     egui::CollapsingHeader::new(
@@ -118,24 +117,22 @@ pub(crate) fn render_setup_card(
                                         if pasteable_singleline(ui, &mut svc.start_cmd, 150.0, "start script...").lost_focus() {
                                             svc_dirty = true;
                                         }
-                                        if ui.small_button("...").clicked() {
-                                            if let Some(p) = FileDialog::new().pick_file() {
+                                        if ui.small_button("...").clicked()
+                                            && let Some(p) = FileDialog::new().pick_file() {
                                                 svc.start_cmd = p.to_string_lossy().to_string();
                                                 svc_dirty = true;
                                             }
-                                        }
                                     });
                                     ui.horizontal(|ui| {
                                         ui.label("Stop: ");
                                         if pasteable_singleline(ui, &mut svc.stop_cmd, 150.0, "stop script...").lost_focus() {
                                             svc_dirty = true;
                                         }
-                                        if ui.small_button("...").clicked() {
-                                            if let Some(p) = FileDialog::new().pick_file() {
+                                        if ui.small_button("...").clicked()
+                                            && let Some(p) = FileDialog::new().pick_file() {
                                                 svc.stop_cmd = p.to_string_lossy().to_string();
                                                 svc_dirty = true;
                                             }
-                                        }
                                     });
                                 });
                             ui.add_space(3.0);
@@ -194,12 +191,11 @@ pub(crate) fn render_setup_card(
                                         if pasteable_singleline(ui, &mut sc.path, 165.0, "script path...").lost_focus() {
                                             sc_dirty = true;
                                         }
-                                        if ui.small_button("...").clicked() {
-                                            if let Some(p) = FileDialog::new().pick_file() {
+                                        if ui.small_button("...").clicked()
+                                            && let Some(p) = FileDialog::new().pick_file() {
                                                 sc.path = p.to_string_lossy().to_string();
                                                 sc_dirty = true;
                                             }
-                                        }
                                     });
                                 });
                             ui.add_space(3.0);
@@ -269,12 +265,9 @@ pub(crate) fn render_setup_card(
                                     } else {
                                         eng.dir_path.as_str()
                                     };
-                                    let mut dlg = FileDialog::new();
+                                    let mut dlg = file_dialog_in(start);
                                     if cfg!(windows) {
                                         dlg = dlg.add_filter("Executable", &["exe"]);
-                                    }
-                                    if Path::new(start).exists() {
-                                        dlg = dlg.set_directory(start);
                                     }
                                     if let Some(p) = dlg.pick_file() {
                                         if let Some(par) = p.parent() {
@@ -295,10 +288,7 @@ pub(crate) fn render_setup_card(
                                     } else {
                                         eng.dir_path.as_str()
                                     };
-                                    let mut dlg = FileDialog::new();
-                                    if Path::new(start).exists() {
-                                        dlg = dlg.set_directory(start);
-                                    }
+                                    let dlg = file_dialog_in(start);
                                     if let Some(p) = dlg.pick_folder() {
                                         eng.dir_path = p.to_string_lossy().to_string();
                                         outcome.save_note = Some(format!("Updated folder for '{}'.", eng.label));
@@ -363,11 +353,10 @@ pub(crate) fn render_setup_card(
                             if let Some(fname) = p.file_name() {
                                 drafts.new_engine_exe = fname.to_string_lossy().to_string();
                             }
-                            if drafts.new_engine_label.trim().is_empty() {
-                                if let Some(stem) = p.file_stem() {
+                            if drafts.new_engine_label.trim().is_empty()
+                                && let Some(stem) = p.file_stem() {
                                     drafts.new_engine_label = stem.to_string_lossy().to_string();
                                 }
-                            }
                         }
                     }
                 });
@@ -384,11 +373,10 @@ pub(crate) fn render_setup_card(
                 }
                 ui.horizontal(|ui| {
                     pasteable_singleline(ui, &mut drafts.new_engine_dir, 140.0, "Folder...");
-                    if ui.small_button("...").clicked() {
-                        if let Some(p) = FileDialog::new().pick_folder() {
+                    if ui.small_button("...").clicked()
+                        && let Some(p) = FileDialog::new().pick_folder() {
                             drafts.new_engine_dir = p.to_string_lossy().to_string();
                         }
-                    }
                     if ui.small_button("+ Save").clicked()
                         && !drafts.new_engine_label.trim().is_empty()
                         && !drafts.new_engine_dir.trim().is_empty()
@@ -426,14 +414,13 @@ pub(crate) fn render_setup_card(
                 ui.label("Models Folder (.gguf):");
                 ui.horizontal(|ui| {
                     pasteable_singleline(ui, &mut cfg.models_dir, 185.0, "");
-                    if ui.button("...").clicked() {
-                        if let Some(p) = FileDialog::new().pick_folder() {
+                    if ui.button("...").clicked()
+                        && let Some(p) = FileDialog::new().pick_folder() {
                             cfg.models_dir = p.to_string_lossy().to_string();
                             *scanned_models = scan_gguf_models(&cfg.models_dir);
                             gguf_cache.clear();
                             outcome.save_note = Some("Updated Models folder.".to_string());
                         }
-                    }
                 });
                 ui.separator();
                 ui.label(
@@ -454,24 +441,22 @@ pub(crate) fn render_setup_card(
                     if pasteable_singleline(ui, &mut cfg.frontend_exe, 185.0, "open-webui / script...").lost_focus() {
                         fe_dirty = true;
                     }
-                    if ui.button("...").clicked() {
-                        if let Some(p) = FileDialog::new().pick_file() {
+                    if ui.button("...").clicked()
+                        && let Some(p) = FileDialog::new().pick_file() {
                             cfg.frontend_exe = p.to_string_lossy().to_string();
                             fe_dirty = true;
                         }
-                    }
                 });
                 ui.label("Frontend Folder (optional):");
                 ui.horizontal(|ui| {
                     if pasteable_singleline(ui, &mut cfg.owu_scripts_dir, 185.0, "Fallback dir (e.g. Scripts/)").lost_focus() {
                         fe_dirty = true;
                     }
-                    if ui.button("...").clicked() {
-                        if let Some(p) = FileDialog::new().pick_folder() {
+                    if ui.button("...").clicked()
+                        && let Some(p) = FileDialog::new().pick_folder() {
                             cfg.owu_scripts_dir = p.to_string_lossy().to_string();
                             fe_dirty = true;
                         }
-                    }
                 });
                 ui.horizontal(|ui| {
                     ui.label("Args:");
@@ -593,6 +578,14 @@ pub(crate) fn render_setup_card(
                 });
                 if ui.checkbox(&mut cfg.use_external_cmd_windows, "Use External CMD").changed() {
                     outcome.save_note = Some("Saved console mode preference.".to_string());
+                }
+                #[cfg(windows)]
+                if ui
+                    .checkbox(&mut cfg.minimize_to_tray, "Close to System Tray")
+                    .on_hover_text("Closing the window hides AI Control Center to the Windows notification area instead of exiting.")
+                    .changed()
+                {
+                    outcome.save_note = Some("Saved system tray preference.".to_string());
                 }
             });
         });

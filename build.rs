@@ -7,8 +7,10 @@ fn find_windres_recursive(dir: &Path, depth: usize) -> Option<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.is_dir() {
-                if let Some(found) = find_windres_recursive(&p, depth - 1) { return Some(found); }
+            if p.is_dir()
+                && let Some(found) = find_windres_recursive(&p, depth - 1)
+            {
+                return Some(found);
             }
         }
     }
@@ -53,9 +55,10 @@ fn main() {
         .args(["-O", "coff", rc_file.to_str().unwrap(), "-o", obj_file.to_str().unwrap()])
         .output();
 
-    if let Ok(out) = status {
-        if out.status.success() && obj_file.exists() {
-            println!("cargo:rustc-link-arg={}", obj_file.display());
-        }
+    if let Ok(out) = status
+        && out.status.success()
+        && obj_file.exists()
+    {
+        println!("cargo:rustc-link-arg={}", obj_file.display());
     }
 }

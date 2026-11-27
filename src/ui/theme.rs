@@ -216,11 +216,9 @@ pub(crate) fn engine_badge_color_for(
                     !el.is_empty() && (el.contains(&low) || low.contains(&el))
                 })
             })
-        {
-            if let Some([r, g, b]) = eng.color_rgb {
+            && let Some([r, g, b]) = eng.color_rgb {
                 return egui::Color32::from_rgb(r, g, b);
             }
-        }
     }
     let [r, g, b] = default_engine_rgb(label_or_tag);
     egui::Color32::from_rgb(r, g, b)
@@ -387,8 +385,8 @@ pub(crate) fn pasteable_singleline(
             let native_p = i.events.iter().any(|e| matches!(e, egui::Event::Paste(_)));
             (paste, copy, native_p)
         });
-        if paste_pressed && !had_native_paste {
-            if let Some(clip) = runtime::read_from_clipboard() {
+        if paste_pressed && !had_native_paste
+            && let Some(clip) = runtime::read_from_clipboard() {
                 let cleaned = clip.replace(['\r', '\n'], " ");
                 let trimmed = cleaned.trim();
                 if !trimmed.is_empty() {
@@ -398,10 +396,30 @@ pub(crate) fn pasteable_singleline(
                     value.push_str(trimmed);
                 }
             }
-        }
         if copy_pressed && !value.is_empty() {
             let _ = runtime::copy_to_clipboard(value);
         }
     }
     resp
+}
+
+pub(crate) fn valid_dialog_dir(dir: &str) -> Option<&std::path::Path> {
+    let trimmed = dir.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(trimmed);
+    if p.is_dir() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+pub(crate) fn file_dialog_in(dir: &str) -> rfd::FileDialog {
+    let mut dlg = rfd::FileDialog::new();
+    if let Some(p) = valid_dialog_dir(dir) {
+        dlg = dlg.set_directory(p);
+    }
+    dlg
 }

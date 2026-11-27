@@ -78,11 +78,10 @@ impl ModelProfile {
             let ex = self.effective_engine_exe();
             if let Some(eng) = saved_engines.iter().find(|e| {
                 (!lbl.is_empty() && e.label.eq_ignore_ascii_case(lbl)) || e.exe_name.eq_ignore_ascii_case(ex)
-            }) {
-                if !eng.default_args.trim().is_empty() {
+            })
+                && !eng.default_args.trim().is_empty() {
                     args = self.expand_custom_template(&eng.default_args, models_dir, "${PORT}");
                 }
-            }
         }
         Self::ensure_swap_port_in_args(&mut args, &self.host);
 
@@ -202,11 +201,10 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
                     .get(m)
                     .cloned()
                     .or_else(|| if used_names.contains(m) { Some(m.clone()) } else { None });
-                if let Some(k) = resolved {
-                    if !member_keys.contains(&k) {
+                if let Some(k) = resolved
+                    && !member_keys.contains(&k) {
                         member_keys.push(k);
                     }
-                }
             }
             if member_keys.is_empty() {
                 continue;
@@ -281,8 +279,8 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
     ) -> String {
         let mut out = String::from("[*]\nflash-attn = on\nthreads = 6\nparallel = 1\njinja = true\n\n");
         for pid in &set.profile_ids {
-            if let Some(prof) = self.find_profile(pid) {
-                if prof.effective_engine_kind() != "custom" {
+            if let Some(prof) = self.find_profile(pid)
+                && prof.effective_engine_kind() != "custom" {
                     let resolved_rpc = self.effective_rpc_for_profile(&prof.single, rpc_reachable);
                     if (prof.use_manual_flags && !prof.manual_flags.trim().is_empty()) || prof.use_advanced_flags {
                         let sec_name = prof.swap_model_id();
@@ -317,7 +315,6 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
                         out.push_str("\n\n");
                     }
                 }
-            }
         }
         out
     }

@@ -190,8 +190,8 @@ fn extract_json_str_field(obj: &str, key: &str) -> Option<String> {
     let bytes = obj.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'"' {
-            if let Some((tok, next_i)) = read_json_string(bytes, i) {
+        if bytes[i] == b'"'
+            && let Some((tok, next_i)) = read_json_string(bytes, i) {
                 i = next_i;
                 while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                     i += 1;
@@ -207,7 +207,6 @@ fn extract_json_str_field(obj: &str, key: &str) -> Option<String> {
                 }
                 continue;
             }
-        }
         i += 1;
     }
     None
@@ -262,8 +261,8 @@ pub fn parse_llama_swap_running_json(body: &str) -> Option<Vec<RunningModelInfo>
             }
             b'}' => {
                 depth_obj = depth_obj.saturating_sub(1);
-                if depth_arr == 1 && depth_obj == 0 {
-                    if let Some(s) = obj_start.take() {
+                if depth_arr == 1 && depth_obj == 0
+                    && let Some(s) = obj_start.take() {
                         let slice = &trimmed[s..=idx];
                         let model = extract_json_str_field(slice, "model")
                             .or_else(|| extract_json_str_field(slice, "id"))
@@ -274,7 +273,6 @@ pub fn parse_llama_swap_running_json(body: &str) -> Option<Vec<RunningModelInfo>
                             out.push(RunningModelInfo { model: m, state });
                         }
                     }
-                }
             }
             _ => {}
         }

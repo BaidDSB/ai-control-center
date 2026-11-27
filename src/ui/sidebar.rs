@@ -1,17 +1,18 @@
 use super::setup::render_setup_card;
 use super::theme::{
-    engine_badge_color_for, pasteable_singleline, themed_card, UiPalette,
+    engine_badge_color_for, file_dialog_in, pasteable_singleline, themed_card, UiPalette,
     ENGINE_COLOR_PALETTE,
 };
 use crate::config::{
-    guess_help_key, slugify, GgufInfo, ModelGroup,
-    ModelProfile, RoutingSet, StackConfig, SwapGroup, SwapPeer, ThemeMode,
+    guess_help_key, profile_matches_search, slugify, GgufInfo, ModelGroup, ModelProfile,
+    RoutingSet, StackConfig, SwapGroup, SwapPeer, ThemeMode,
 };
 use crate::platform;
 use eframe::egui;
 use std::collections::HashMap;
 
 pub(crate) struct SidebarDrafts {
+    pub search_query: String,
     pub new_set_name: String,
     pub new_group_name: String,
     pub new_profile_name: String,
@@ -27,6 +28,7 @@ pub(crate) struct SidebarDrafts {
 impl SidebarDrafts {
     pub(crate) fn new() -> Self {
         Self {
+            search_query: String::new(),
             new_set_name: String::new(),
             new_group_name: String::new(),
             new_profile_name: String::new(),
@@ -589,28 +591,25 @@ pub(crate) fn render_left_workspace(
                         });
                 }
 
-                if let Some(pid) = jump_to_pid {
-                    if let Some((gi, pi)) = cfg.find_profile_pos(&pid) {
+                if let Some(pid) = jump_to_pid
+                    && let Some((gi, pi)) = cfg.find_profile_pos(&pid) {
                         cfg.selected_group_idx = gi;
                         cfg.selected_profile_idx = pi;
                         if let Some(p) = cfg.groups.get(gi).and_then(|g| g.profiles.get(pi)) {
                             *status_msg = format!("Selected '{}' from Routing Set.", p.name);
                         }
                     }
-                }
-                if let Some(li) = unlink_req {
-                    if let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
+                if let Some(li) = unlink_req
+                    && let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                         set.profile_ids.remove(li);
                         outcome.save_note = Some("Unlinked profile from Routing Set.".to_string());
                     }
-                }
-                if let Some((a, b)) = move_link_req {
-                    if let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
+                if let Some((a, b)) = move_link_req
+                    && let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                         set.profile_ids.swap(a, b);
                         outcome.save_note =
                             Some("Reordered linked profiles in Routing Set.".to_string());
                     }
-                }
             });
 
             ui.add_space(8.0);
@@ -650,6 +649,23 @@ pub(crate) fn render_left_workspace(
                                     }
 
                                     let hdr_col = if edit_mode { pal.edit_hl } else { pal.muted };
+                                    ui.horizontal(|ui| {
+                                        pasteable_singleline(
+                                            ui,
+                                            &mut drafts.search_query,
+                                            (col1_w - 72.0).max(90.0),
+                                            "Search families/profiles...",
+                                        );
+                                        if !drafts.search_query.is_empty()
+                                            && ui
+                                                .small_button("X")
+                                                .on_hover_text("Clear search filter")
+                                                .clicked()
+                                        {
+                                            drafts.search_query.clear();
+                                        }
+                                    });
+                                    ui.add_space(4.0);
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new("1. MODEL FAMILIES")
@@ -673,9 +689,11 @@ pub(crate) fn render_left_workspace(
                                             {
                                                 let title = drafts.new_group_name.trim().to_string();
                                                 let uid = cfg.make_unique_profile_id(&title);
-                                                let mut default_prof = ModelProfile::default();
-                                                default_prof.id = uid;
-                                                default_prof.help_key = guess_help_key(&title, "");
+                                                let default_prof = ModelProfile {
+                                                    id: uid,
+                                                    help_key: guess_help_key(&title, ""),
+                                                    ..ModelProfile::default()
+                                                };
                                                 cfg.groups.push(ModelGroup {
                                                     model_title: title.clone(),
                                                     subtitle: "Custom GGUF Family".to_string(),
@@ -694,12 +712,22 @@ pub(crate) fn render_left_workspace(
                                     let mut swap_groups: Option<(usize, usize)> = None;
                                     let mut del_group_idx: Option<usize> = None;
                                     let glen = cfg.groups.len();
+                                    let filter_q = drafts.search_query.trim().to_string();
+                                    let mut matched_families = 0usize;
 
                                     for idx in 0..glen {
                                         let is_sel = cfg.selected_group_idx == idx;
                                         let title = cfg.groups[idx].model_title.clone();
                                         let sub = cfg.groups[idx].subtitle.clone();
                                         let count = cfg.groups[idx].profiles.len();
+                                        if !filter_q.is_empty()
+                                            && !cfg.groups[idx].profiles.iter().any(|p| {
+                                                profile_matches_search(&title, &sub, p, &filter_q)
+                                            })
+                                        {
+                                            continue;
+                                        }
+                                        matched_families += 1;
 
                                         let (cfill, cborder) = if is_sel {
                                             (pal.item_sel_bg, pal.item_sel_border)
@@ -744,14 +772,12 @@ pub(crate) fn render_left_workspace(
                                                         egui::Sense::click(),
                                                     )
                                                     .clicked()
-                                                {
-                                                    if cfg.selected_group_idx != idx {
+                                                    && cfg.selected_group_idx != idx {
                                                         cfg.selected_group_idx = idx;
                                                         cfg.selected_profile_idx = 0;
                                                         let _ = cfg.save();
                                                         *saved_cfg = cfg.clone();
                                                     }
-                                                }
 
                                                 if edit_mode {
                                                     ui.add_space(4.0);
@@ -803,6 +829,13 @@ pub(crate) fn render_left_workspace(
                                         ui.add_space(4.0);
                                     }
 
+                                    if !filter_q.is_empty() && matched_families == 0 {
+                                        ui.label(
+                                            egui::RichText::new("No matching families or profiles.")
+                                                .size(11.0)
+                                                .color(pal.muted),
+                                        );
+                                    }
                                     if let Some((a, b)) = swap_groups {
                                         cfg.groups.swap(a, b);
                                         if cfg.selected_group_idx == a {
@@ -813,8 +846,8 @@ pub(crate) fn render_left_workspace(
                                         outcome.save_note =
                                             Some("Reordered Model Families and saved.".to_string());
                                     }
-                                    if let Some(di) = del_group_idx {
-                                        if cfg.groups.len() > 1 {
+                                    if let Some(di) = del_group_idx
+                                        && cfg.groups.len() > 1 {
                                             let removed = cfg.groups.remove(di);
                                             let removed_ids: Vec<String> = removed
                                                 .profiles
@@ -833,7 +866,6 @@ pub(crate) fn render_left_workspace(
                                                 removed.model_title
                                             ));
                                         }
-                                    }
                                 });
                         });
                     },
@@ -863,15 +895,54 @@ pub(crate) fn render_left_workspace(
                             let hdr_col = if edit_mode { pal.edit_hl } else { pal.muted };
                             let sub_col = if edit_mode { pal.edit_hl } else { pal.accent };
 
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new("2. SUB-PROFILES")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(hdr_col),
-                                )
-                                .selectable(false),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("2. SUB-PROFILES")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(hdr_col),
+                                    )
+                                    .selectable(false),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .small_button("Import")
+                                        .on_hover_text("Import a portable profile (.toml) into this Model Family")
+                                        .clicked()
+                                        && let Some(path) = file_dialog_in("")
+                                            .add_filter("Profile TOML", &["toml", "TOML"])
+                                            .pick_file()
+                                    {
+                                        match std::fs::read_to_string(&path) {
+                                            Ok(raw) => match ModelProfile::from_portable_toml(&raw, scanned_models) {
+                                                Ok(mut imported) => {
+                                                    let seed = if imported.name.trim().is_empty() {
+                                                        "imported-profile".to_string()
+                                                    } else {
+                                                        format!("{g_title}-{}", imported.name)
+                                                    };
+                                                    imported.id = cfg.make_unique_profile_id(&seed);
+                                                    let imported_name = imported.name.clone();
+                                                    if let Some(grp) = cfg.groups.get_mut(g_idx) {
+                                                        grp.profiles.push(imported);
+                                                        cfg.selected_profile_idx = grp.profiles.len() - 1;
+                                                        outcome.save_note = Some(format!(
+                                                            "Imported profile '{imported_name}' into '{g_title}'."
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    *status_msg = format!("Profile import failed: {e}");
+                                                }
+                                            },
+                                            Err(e) => {
+                                                *status_msg = format!("Failed reading file: {e}");
+                                            }
+                                        }
+                                    }
+                                });
+                            });
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&g_title)
@@ -935,8 +1006,18 @@ pub(crate) fn render_left_workspace(
                                 .show(ui, |ui| {
                                     if let Some(grp) = cfg.groups.get(g_idx) {
                                         let plen = grp.profiles.len();
-                                        for pidx in 0..plen {
-                                            let p = &grp.profiles[pidx];
+                                        let filter_q = drafts.search_query.trim();
+                                        for (pidx, p) in grp.profiles.iter().enumerate() {
+                                            if !filter_q.is_empty()
+                                                && !profile_matches_search(
+                                                    &grp.model_title,
+                                                    &grp.subtitle,
+                                                    p,
+                                                    filter_q,
+                                                )
+                                            {
+                                                continue;
+                                            }
                                             let is_sel = cfg.selected_profile_idx == pidx;
                                             let pid = p.id.clone();
                                             let pname = p.name.clone();
@@ -1102,8 +1183,8 @@ pub(crate) fn render_left_workspace(
                                     }
                                 });
 
-                            if let Some(pid) = toggle_link_pid {
-                                if let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
+                            if let Some(pid) = toggle_link_pid
+                                && let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                                     if let Some(pos) = set.profile_ids.iter().position(|x| x == &pid)
                                     {
                                         set.profile_ids.remove(pos);
@@ -1118,9 +1199,8 @@ pub(crate) fn render_left_workspace(
                                         );
                                     }
                                 }
-                            }
-                            if let Some((a, b)) = swap_profs {
-                                if let Some(grp) = cfg.groups.get_mut(g_idx) {
+                            if let Some((a, b)) = swap_profs
+                                && let Some(grp) = cfg.groups.get_mut(g_idx) {
                                     grp.profiles.swap(a, b);
                                     if cfg.selected_profile_idx == a {
                                         cfg.selected_profile_idx = b;
@@ -1130,9 +1210,8 @@ pub(crate) fn render_left_workspace(
                                     outcome.save_note =
                                         Some("Reordered sub-profiles and saved.".to_string());
                                 }
-                            }
-                            if let Some(di) = dup_prof {
-                                if let Some(orig) = cfg
+                            if let Some(di) = dup_prof
+                                && let Some(orig) = cfg
                                     .groups
                                     .get(g_idx)
                                     .and_then(|g| g.profiles.get(di))
@@ -1150,18 +1229,16 @@ pub(crate) fn render_left_workspace(
                                             Some("Duplicated sub-profile.".to_string());
                                     }
                                 }
-                            }
                             if let Some(di) = del_prof {
                                 let mut removed_info: Option<(String, String)> = None;
-                                if let Some(grp) = cfg.groups.get_mut(g_idx) {
-                                    if grp.profiles.len() > 1 {
+                                if let Some(grp) = cfg.groups.get_mut(g_idx)
+                                    && grp.profiles.len() > 1 {
                                         let removed = grp.profiles.remove(di);
                                         removed_info = Some((removed.id, removed.name));
                                         if cfg.selected_profile_idx >= grp.profiles.len() {
                                             cfg.selected_profile_idx = grp.profiles.len() - 1;
                                         }
                                     }
-                                }
                                 if let Some((rid, rname)) = removed_info {
                                     for s in &mut cfg.routing_sets {
                                         s.profile_ids.retain(|x| x != &rid);
