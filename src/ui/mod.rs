@@ -59,6 +59,8 @@ struct ControlCenterApp {
     loaded_label: Option<String>,
     shared_status: Arc<Mutex<ProcStatus>>,
     shared_comp_ports: Arc<Mutex<Vec<u16>>>,
+    shared_telemetry: Arc<Mutex<crate::runtime::TelemetrySnapshot>>,
+    shared_api_target: Arc<Mutex<(String, u16)>>,
     llama_console: SharedConsole,
     owu_console: SharedConsole,
     show_llama_console: Arc<AtomicBool>,
@@ -123,11 +125,16 @@ impl ControlCenterApp {
          None
      };
 
+     let init_telemetry = crate::runtime::poll_telemetry(&cfg.server_host, cfg.server_port, initial.llama);
      let shared_status = Arc::new(Mutex::new(initial));
      let shared_comp_ports = Arc::new(Mutex::new(init_comp_ports));
-     let (bg_status, bg_ports, bg_ctx) = (
+     let shared_telemetry = Arc::new(Mutex::new(init_telemetry));
+     let shared_api_target = Arc::new(Mutex::new((cfg.server_host.clone(), cfg.server_port)));
+     let (bg_status, bg_ports, bg_tele, bg_api, bg_ctx) = (
          Arc::clone(&shared_status),
          Arc::clone(&shared_comp_ports),
+         Arc::clone(&shared_telemetry),
+         Arc::clone(&shared_api_target),
          ctx.clone(),
      );
 
@@ -137,6 +144,14 @@ impl ControlCenterApp {
          let latest = poll_tracked_processes(&ports);
          if let Ok(mut guard) = bg_status.lock() {
              *guard = latest;
+         }
+         let (api_host, api_port) = bg_api
+             .lock()
+             .map(|g| g.clone())
+             .unwrap_or_else(|_| ("127.0.0.1".to_string(), 8080));
+         let snap = crate::runtime::poll_telemetry(&api_host, api_port, latest.llama);
+         if let Ok(mut guard) = bg_tele.lock() {
+             *guard = snap;
          }
          bg_ctx.request_repaint_of(egui::ViewportId::ROOT);
      });
@@ -157,6 +172,8 @@ impl ControlCenterApp {
          loaded_label,
          shared_status,
          shared_comp_ports,
+         shared_telemetry,
+         shared_api_target,
          llama_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
          owu_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
          show_llama_console: Arc::new(AtomicBool::new(false)),
@@ -183,6 +200,9 @@ impl ControlCenterApp {
              .iter()
              .map(|s| s.check_port)
              .collect();
+     }
+     if let Ok(mut g) = self.shared_api_target.lock() {
+         *g = (self.cfg.server_host.clone(), self.cfg.server_port);
      }
  }
 
@@ -233,6 +253,13 @@ impl ControlCenterApp {
         if let Ok(mut g) = self.shared_status.lock() {
             *g = s;
         }
+    }
+
+    pub(super) fn current_telemetry(&self) -> crate::runtime::TelemetrySnapshot {
+        self.shared_telemetry
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -856,6 +883,12 @@ impl eframe::App for ControlCenterApp {
                                                         }
                                                     });
                                                 let rpc_fallback = self.cfg.secondary_node.rpc_fallback;
+                                                let local_vram_mib = self
+                                                    .shared_telemetry
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|t| t.gpu_vram.as_ref().map(|g| g.total_mib))
+                                                    .filter(|&m| m > 0);
                                                 let mut port_copy = prof.port;
                                                 render_spec_inspector(
                                                     ui,
@@ -870,6 +903,7 @@ impl eframe::App for ControlCenterApp {
                                                     &mut port_copy,
                                                     sec_rpc_ep.as_deref(),
                                                     rpc_fallback,
+                                                    local_vram_mib,
                                                     "cc_single_slot",
                                                     &mut trigger_save_msg,
                                                 );

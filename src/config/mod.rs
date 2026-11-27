@@ -337,4 +337,67 @@ mod tests {
 
         assert!(cfg.detect_rpc_peer_collisions(&set).is_empty());
     }
+
+    #[test]
+    fn estimate_profile_vram_accounts_for_kv_quant_and_moe_offload() {
+        let info = GgufInfo {
+            valid: true,
+            file_size_gb: 20.0,
+            arch: "qwen3moe".to_string(),
+            block_count: Some(40),
+            context_length: Some(131072),
+            expert_count: Some(128),
+            head_count: Some(32),
+            head_count_kv: Some(4),
+            embedding_length: Some(4096),
+            key_length: Some(128),
+            value_length: Some(128),
+        };
+        let mut spec = ModelSpec::default();
+        spec.ngl_mode = "custom".to_string();
+        spec.ngl_layers = 999;
+        spec.ctx_size = 65536;
+        spec.cache_type_k = "q8_0".to_string();
+        spec.cache_type_v = "q8_0".to_string();
+        spec.moe_enabled = true;
+        spec.all_moe_cpu = true;
+
+        let est_q8 = estimate_profile_vram(&info, &spec).expect("valid estimate");
+        assert!(!est_q8.is_approximate);
+        assert!(est_q8.weights_vram_gb < 4.0);
+        assert!(est_q8.total_ram_offload_gb > 15.0);
+
+        spec.cache_type_k = "q4_0".to_string();
+        spec.cache_type_v = "q4_0".to_string();
+        let est_q4 = estimate_profile_vram(&info, &spec).expect("valid q4 estimate");
+        assert!(est_q4.kv_cache_gb < est_q8.kv_cache_gb);
+    }
+
+    #[test]
+    fn estimate_profile_vram_moves_kv_to_ram_when_no_kv_offload() {
+        let info = GgufInfo {
+            valid: true,
+            file_size_gb: 4.0,
+            arch: "qwen2".to_string(),
+            block_count: Some(32),
+            context_length: Some(32768),
+            expert_count: None,
+            head_count: Some(32),
+            head_count_kv: Some(8),
+            embedding_length: Some(4096),
+            key_length: Some(128),
+            value_length: Some(128),
+        };
+        let mut spec = ModelSpec::default();
+        spec.ctx_size = 32768;
+        spec.no_kv_offload = false;
+        let on_gpu = estimate_profile_vram(&info, &spec).expect("gpu kv");
+        assert!(on_gpu.kv_cache_gb > 0.5);
+
+        spec.no_kv_offload = true;
+        let on_ram = estimate_profile_vram(&info, &spec).expect("ram kv");
+        assert_eq!(on_ram.kv_cache_gb, 0.0);
+        assert!(on_ram.total_ram_offload_gb >= on_gpu.kv_cache_gb - 0.01);
+        assert!(on_ram.total_vram_gb < on_gpu.total_vram_gb);
+    }
 }

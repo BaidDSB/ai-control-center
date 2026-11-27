@@ -1,10 +1,12 @@
 pub mod console;
 pub mod launcher;
 pub mod state;
+pub mod telemetry;
 
 pub use console::*;
 pub use launcher::*;
 pub use state::*;
+pub use telemetry::*;
 
 #[cfg(test)]
 mod tests {
@@ -83,5 +85,79 @@ mod tests {
         assert!(probe_tcp_endpoint(&addr, 120));
         drop(listener);
         assert!(!probe_tcp_endpoint(&addr, 120));
+    }
+
+    #[test]
+    fn parse_llama_swap_running_json_extracts_models_and_handles_empty() {
+        let json = r#"{"running":[{"model":"qwen3.6-35b-a3b","state":"ready"},{"id":"bge-m3","state":"loading"}]}"#;
+        let parsed = parse_llama_swap_running_json(json).expect("valid running json");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].model, "qwen3.6-35b-a3b");
+        assert_eq!(parsed[0].state, "ready");
+        assert_eq!(parsed[1].model, "bge-m3");
+        assert_eq!(parsed[1].state, "loading");
+
+        let empty = parse_llama_swap_running_json(r#"{"running":[]}"#).expect("empty running json");
+        assert!(empty.is_empty());
+        assert!(parse_llama_swap_running_json("not json").is_none());
+    }
+
+    #[test]
+    fn parse_nvidia_smi_csv_reads_used_total_and_name() {
+        let sample = "2145, 8192, NVIDIA GeForce RTX 3070\n";
+        let info = parse_nvidia_smi_csv(sample).expect("parse nvidia-smi csv");
+        assert_eq!(info.used_mib, 2145);
+        assert_eq!(info.total_mib, 8192);
+        assert_eq!(info.name, "NVIDIA GeForce RTX 3070");
+        assert!((info.total_gb() - 8.0).abs() < 0.01);
+        assert!(parse_nvidia_smi_csv("bad line").is_none());
+    }
+
+    #[test]
+    fn select_gpu_adapter_sample_matches_discrete_gpu_on_multi_gpu() {
+        // Simulate iGPU (128 MiB ded, 650 MiB shared) + dGPU (5400 MiB ded, 320 MiB shared)
+        let samples = vec![(128, 650), (5400, 320)];
+        assert_eq!(select_gpu_adapter_sample(&samples, Some(5480)), Some((5400, 320)));
+        assert_eq!(select_gpu_adapter_sample(&samples, None), Some((5400, 320)));
+        assert_eq!(select_gpu_adapter_sample(&[], Some(1000)), None);
+    }
+
+    #[test]
+    fn local_http_client_polls_running_and_soft_unloads() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock swap");
+        let port = listener.local_addr().expect("addr").port();
+
+        let srv = thread::spawn(move || {
+            for _ in 0..2 {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut req_buf = [0u8; 512];
+                    let n = stream.read(&mut req_buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&req_buf[..n]);
+                    if req.starts_with("GET /running") {
+                        let body = r#"{"running":[{"model":"qwen3.6-35b","state":"ready"}]}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    } else if req.starts_with("GET /unload") {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        );
+                    }
+                }
+            }
+        });
+
+        let running = poll_llama_swap_running("127.0.0.1", port).expect("poll /running");
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].model, "qwen3.6-35b");
+        assert!(soft_unload_llama_swap("127.0.0.1", port).is_ok());
+        let _ = srv.join();
     }
 }

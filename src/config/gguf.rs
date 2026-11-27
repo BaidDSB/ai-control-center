@@ -10,6 +10,111 @@ pub struct GgufInfo {
     pub block_count: Option<u64>,
     pub context_length: Option<u64>,
     pub expert_count: Option<u64>,
+    pub head_count: Option<u64>,
+    pub head_count_kv: Option<u64>,
+    pub embedding_length: Option<u64>,
+    pub key_length: Option<u64>,
+    pub value_length: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct VramEstimate {
+    pub weights_vram_gb: f64,
+    pub kv_cache_gb: f64,
+    pub overhead_gb: f64,
+    pub total_vram_gb: f64,
+    pub total_ram_offload_gb: f64,
+    pub is_approximate: bool,
+}
+
+fn kv_bytes_per_elem(kind: &str) -> f64 {
+    match kind.trim().to_ascii_lowercase().as_str() {
+        "f32" => 4.0,
+        "f16" | "bf16" => 2.0,
+        "q8_0" => 1.0625,
+        "q5_0" | "q5_1" => 0.6875,
+        "q4_0" | "q4_1" | "iq4_nl" | "turbo4" | "tq4" => 0.5625,
+        "turbo3" | "tq3" => 0.4375,
+        "turbo2" | "tq2" => 0.3125,
+        _ => 1.0625,
+    }
+}
+
+pub fn estimate_profile_vram(info: &GgufInfo, spec: &super::schema::ModelSpec) -> Option<VramEstimate> {
+    if !info.valid || info.file_size_gb <= 0.0 {
+        return None;
+    }
+    let layers = info.block_count.unwrap_or(32).max(1) as f64;
+    let gpu_layer_frac = if spec.ngl_mode == "auto" {
+        1.0
+    } else {
+        (spec.ngl_layers as f64 / layers).clamp(0.0, 1.0)
+    };
+
+    let mut weights_vram = info.file_size_gb * gpu_layer_frac;
+    let mut ram_offload = (info.file_size_gb - weights_vram).max(0.0);
+
+    let is_moe = info.expert_count.unwrap_or(0) > 1 || spec.moe_enabled;
+    if is_moe {
+        if spec.all_moe_cpu {
+            let moved = weights_vram * 0.84;
+            weights_vram -= moved;
+            ram_offload += moved;
+        } else if spec.moe_enabled && spec.n_cpu_moe > 0 {
+            let off_frac = (spec.n_cpu_moe as f64 / layers).clamp(0.0, 1.0);
+            let moved = weights_vram * 0.84 * off_frac;
+            weights_vram -= moved;
+            ram_offload += moved;
+            if spec.moe_cache_mib > 0 {
+                let cache_gb = spec.moe_cache_mib as f64 / 1024.0;
+                weights_vram += cache_gb;
+                ram_offload = (ram_offload - cache_gb).max(0.0);
+            }
+        }
+    } else if spec.n_cpu_ffn > 0 {
+        let off_frac = (spec.n_cpu_ffn as f64 / layers).clamp(0.0, 1.0);
+        let moved = weights_vram * 0.65 * off_frac;
+        weights_vram -= moved;
+        ram_offload += moved;
+    }
+
+    let b_k = kv_bytes_per_elem(&spec.cache_type_k);
+    let b_v = kv_bytes_per_elem(&spec.cache_type_v);
+    let ctx = spec.ctx_size.max(512) as f64;
+    let parallel = spec.parallel_slots.max(1) as f64;
+
+    let (kv_total_gb, is_approximate) = if let Some(h_kv) = info.head_count_kv {
+        let fallback_dim = match (info.embedding_length, info.head_count) {
+            (Some(emb), Some(hc)) if hc > 0 => emb / hc,
+            _ => 128,
+        };
+        let d_k = info.key_length.unwrap_or(fallback_dim) as f64;
+        let d_v = info.value_length.unwrap_or(fallback_dim) as f64;
+        let bytes = layers * ctx * parallel * (h_kv as f64) * (d_k * b_k + d_v * b_v);
+        (bytes / (1024.0 * 1024.0 * 1024.0), false)
+    } else {
+        let approx_gb = 0.000125 * layers * (ctx / 1024.0) * parallel * ((b_k + b_v) * 0.5);
+        (approx_gb, true)
+    };
+
+    let kv_vram_gb = if spec.no_kv_offload || gpu_layer_frac <= 0.0 {
+        ram_offload += kv_total_gb;
+        0.0
+    } else {
+        kv_total_gb
+    };
+
+    let overhead_gb = if gpu_layer_frac > 0.0 { 0.45 } else { 0.0 };
+    let total_vram_gb = weights_vram + kv_vram_gb + overhead_gb;
+
+    Some(VramEstimate {
+        weights_vram_gb: weights_vram,
+        kv_cache_gb: kv_vram_gb,
+        overhead_gb,
+        total_vram_gb,
+        total_ram_offload_gb: ram_offload,
+        is_approximate: is_approximate || spec.ngl_mode == "auto",
+    })
 }
 
 fn read_u32_le<R: Read>(r: &mut R) -> Option<u32> {
@@ -70,30 +175,32 @@ pub fn probe_gguf_header(models_dir: &str, rel_path: &str) -> GgufInfo {
         valid: true,
         file_size_gb: size_gb,
         arch: "unknown".to_string(),
-        block_count: None,
-        context_length: None,
-        expert_count: None,
+        ..GgufInfo::default()
     };
 
     for _ in 0..kv_cnt.min(512) {
         let Some(key) = read_gguf_str(&mut r) else { break; };
         let Some(vtype) = read_u32_le(&mut r) else { break; };
+        let is_uint = vtype == 4 || vtype == 10;
         if key == "general.architecture" && vtype == 8 {
             if let Some(s) = read_gguf_str(&mut r) { info.arch = s; } else { break; }
-        } else if key.ends_with(".block_count") && (vtype == 4 || vtype == 10) {
+        } else if key.ends_with(".block_count") && is_uint {
             info.block_count = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
-        } else if key.ends_with(".context_length") && (vtype == 4 || vtype == 10) {
+        } else if key.ends_with(".context_length") && is_uint {
             info.context_length = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
-        } else if key.ends_with(".expert_count") && (vtype == 4 || vtype == 10) {
+        } else if key.ends_with(".expert_count") && is_uint {
             info.expert_count = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
+        } else if key.ends_with(".embedding_length") && is_uint {
+            info.embedding_length = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
+        } else if key.ends_with(".attention.head_count") && is_uint {
+            info.head_count = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
+        } else if key.ends_with(".attention.head_count_kv") && is_uint {
+            info.head_count_kv = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
+        } else if key.ends_with(".attention.key_length") && is_uint {
+            info.key_length = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
+        } else if key.ends_with(".attention.value_length") && is_uint {
+            info.value_length = if vtype == 4 { read_u32_le(&mut r).map(|v| v as u64) } else { read_u64_le(&mut r) };
         } else if skip_gguf_val(&mut r, vtype).is_none() {
-            break;
-        }
-        if info.arch != "unknown"
-            && info.block_count.is_some()
-            && info.context_length.is_some()
-            && info.expert_count.is_some()
-        {
             break;
         }
     }

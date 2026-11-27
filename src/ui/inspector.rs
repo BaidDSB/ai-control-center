@@ -1,5 +1,8 @@
 use super::theme::{pasteable_singleline, pill_switch, plain_help_row, UiPalette};
-use crate::config::{probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec, RpcFallbackPolicy};
+use crate::config::{
+    estimate_profile_vram, probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec,
+    RpcFallbackPolicy,
+};
 use crate::runtime;
 use eframe::egui;
 use rfd::FileDialog;
@@ -37,6 +40,7 @@ pub(crate) fn render_spec_inspector(
     port_val: &mut u16,
     secondary_rpc_ep: Option<&str>,
     rpc_fallback: RpcFallbackPolicy,
+    local_vram_mib: Option<u64>,
     id_salt: &str,
     trigger_save_msg: &mut Option<String>,
 ) {
@@ -112,6 +116,51 @@ pub(crate) fn render_spec_inspector(
             )
             .selectable(false),
         );
+
+        if let Some(est) = estimate_profile_vram(&ginfo, spec) {
+            let approx = if est.is_approximate { "~" } else { "" };
+            let ram_part = if est.total_ram_offload_gb >= 0.05 {
+                format!(" | Est. RAM offload: {:.1} GB", est.total_ram_offload_gb)
+            } else {
+                String::new()
+            };
+            let (fit_tag, fit_col) = if let Some(vram_mib) = local_vram_mib.filter(|&m| m > 0) {
+                let cap_gb = vram_mib as f64 / 1024.0;
+                let ratio = est.total_vram_gb / cap_gb;
+                if ratio > 0.98 {
+                    if spec.use_rpc {
+                        (format!(" [>{cap_gb:.1} GB local — using RPC pool]"), c_vram)
+                    } else {
+                        (
+                            format!(" [Exceeds {:.1} GB local VRAM]", cap_gb),
+                            if is_light {
+                                egui::Color32::from_rgb(185, 28, 28)
+                            } else {
+                                egui::Color32::from_rgb(248, 113, 113)
+                            },
+                        )
+                    }
+                } else if ratio > 0.85 {
+                    (format!(" [Tight on {:.1} GB GPU]", cap_gb), c_qual)
+                } else {
+                    (format!(" [Fits {:.1} GB GPU]", cap_gb), c_speed)
+                }
+            } else {
+                (String::new(), pal.muted)
+            };
+
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Pre-Launch Est. VRAM: {approx}{:.1} GB (Weights {:.1} + KV {:.1} + Buf {:.1}){ram_part}{fit_tag}",
+                        est.total_vram_gb, est.weights_vram_gb, est.kv_cache_gb, est.overhead_gb
+                    ))
+                    .size(11.0)
+                    .color(fit_col),
+                )
+                .selectable(false),
+            );
+        }
     }
 
     ui.add_space(4.0);

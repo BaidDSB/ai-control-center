@@ -535,6 +535,124 @@ impl ControlCenterApp {
                 }
 
                 ui.separator();
+                let tele = self.current_telemetry();
+                if let Some(gpu) = &tele.gpu_vram {
+                    let is_light = self.cfg.theme_mode == ThemeMode::Light;
+                    let ratio = gpu.usage_ratio();
+                    let vram_col = if gpu.total_mib > 0 && ratio >= 0.90 {
+                        egui::Color32::from_rgb(239, 68, 68)
+                    } else if gpu.total_mib > 0 && ratio >= 0.75 {
+                        egui::Color32::from_rgb(245, 158, 11)
+                    } else if is_light {
+                        egui::Color32::from_rgb(14, 124, 78)
+                    } else {
+                        egui::Color32::from_rgb(52, 211, 153)
+                    };
+                    let vram_lbl = if gpu.total_mib > 0 {
+                        format!("VRAM: {:.1}/{:.1} GB", gpu.used_gb(), gpu.total_gb())
+                    } else {
+                        format!("VRAM: {:.1} GB", gpu.used_gb())
+                    };
+                    let mut tip = if gpu.total_mib > 0 {
+                        format!("{} — Dedicated: {} / {} MiB", gpu.name, gpu.used_mib, gpu.total_mib)
+                    } else {
+                        format!("{} — Dedicated: {} MiB", gpu.name, gpu.used_mib)
+                    };
+                    if let Some(su) = gpu.shared_used_mib {
+                        if let Some(st) = gpu.shared_total_mib.filter(|&v| v > 0) {
+                            tip.push_str(&format!("\nShared GPU: {su} / {st} MiB"));
+                        } else {
+                            tip.push_str(&format!("\nShared GPU: {su} MiB"));
+                        }
+                    }
+                    if let (Some(ru), Some(rt)) = (gpu.sys_ram_used_gb(), gpu.sys_ram_total_gb()) {
+                        tip.push_str(&format!("\nSystem RAM: {ru:.1} / {rt:.1} GB"));
+                    }
+
+                    ui.label(
+                        egui::RichText::new(vram_lbl)
+                            .size(11.5)
+                            .strong()
+                            .color(vram_col),
+                    )
+                    .on_hover_text(&tip);
+
+                    if let Some(sh_used_mib) = gpu.shared_used_mib {
+                        let sh_col = if sh_used_mib >= 1536 {
+                            egui::Color32::from_rgb(239, 68, 68)
+                        } else if sh_used_mib >= 512 {
+                            egui::Color32::from_rgb(245, 158, 11)
+                        } else {
+                            pal.muted
+                        };
+                        let sh_used_gb = gpu.shared_used_gb().unwrap_or(0.0);
+                        let sh_lbl = if let Some(sh_tot_gb) = gpu.shared_total_gb().filter(|&g| g > 0.0) {
+                            format!("Shared: {sh_used_gb:.1}/{sh_tot_gb:.1} GB")
+                        } else {
+                            format!("Shared: {sh_used_gb:.1} GB")
+                        };
+                        ui.label(
+                            egui::RichText::new(sh_lbl)
+                                .size(11.5)
+                                .strong()
+                                .color(sh_col),
+                        )
+                        .on_hover_text(&tip);
+                    }
+                }
+                if procs.llama && tele.swap_reachable {
+                    if tele.running_models.is_empty() {
+                        ui.label(
+                            egui::RichText::new("Swap: Idle")
+                                .size(11.5)
+                                .color(pal.muted),
+                        )
+                        .on_hover_text("llama-swap is running with no model currently loaded in VRAM.");
+                    } else {
+                        let names: Vec<&str> = tele
+                            .running_models
+                            .iter()
+                            .map(|m| m.model.as_str())
+                            .collect();
+                        ui.label(
+                            egui::RichText::new(format!("Active: {}", names.join(", ")))
+                                .size(11.5)
+                                .strong()
+                                .color(pal.accent),
+                        )
+                        .on_hover_text("Live models reported by llama-swap /running.");
+                        if ui
+                            .button("Soft Unload")
+                            .on_hover_text("Calls llama-swap /unload to free VRAM without stopping the router.")
+                            .clicked()
+                        {
+                            match crate::runtime::soft_unload_llama_swap(
+                                &self.cfg.server_host,
+                                self.cfg.server_port,
+                            ) {
+                                Ok(()) => {
+                                    if let Ok(mut g) = self.shared_telemetry.lock() {
+                                        g.running_models.clear();
+                                    }
+                                    self.status_msg = "Sent Soft Unload to llama-swap — VRAM freeing.".to_string();
+                                }
+                                Err(e) => self.push_error(format!("Soft Unload failed: {e}")),
+                            }
+                        }
+                    }
+                    if ui
+                        .button("Swap /ui")
+                        .on_hover_text("Open llama-swap's built-in web dashboard.")
+                        .clicked()
+                    {
+                        platform::open_url(&crate::runtime::llama_swap_ui_url(
+                            &self.cfg.server_host,
+                            self.cfg.server_port,
+                        ));
+                    }
+                }
+
+                ui.separator();
                 if ui.button("Open Browser").clicked() {
                     platform::open_url(&self.cfg.effective_frontend_url());
                 }
