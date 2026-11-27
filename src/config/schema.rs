@@ -256,6 +256,8 @@ pub struct ModelProfile {
     #[serde(default = "default_ttl")]
     pub ttl_seconds: u32,
     #[serde(default)]
+    pub check_endpoint: String,
+    #[serde(default)]
     pub engine_label: String,
     #[serde(default)]
     pub engine_kind: String, // "llama_cpp" | "custom"
@@ -288,6 +290,7 @@ impl Default for ModelProfile {
             help_key: String::new(),
             help_variant: String::new(),
             ttl_seconds: 600,
+            check_endpoint: String::new(),
             engine_label: String::new(),
             engine_kind: String::new(),
             engine_dir_override: String::new(),
@@ -358,6 +361,59 @@ pub struct ModelGroup {
     pub profiles: Vec<ModelProfile>,
 }
 
+fn default_peer_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SwapPeer {
+    #[serde(default = "default_peer_enabled")]
+    pub enabled: bool,
+    pub name: String,
+    pub proxy: String,
+    #[serde(default)]
+    pub api_key: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+impl Default for SwapPeer {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            name: String::new(),
+            proxy: String::new(),
+            api_key: String::new(),
+            models: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SwapGroup {
+    pub name: String,
+    #[serde(default)]
+    pub swap: bool,
+    #[serde(default)]
+    pub exclusive: bool,
+    #[serde(default)]
+    pub persistent: bool,
+    #[serde(default)]
+    pub members: Vec<String>,
+}
+
+impl Default for SwapGroup {
+    fn default() -> Self {
+        Self {
+            name: "concurrent".to_string(),
+            swap: false,
+            exclusive: false,
+            persistent: false,
+            members: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RoutingSet {
     pub id: String,
@@ -368,6 +424,43 @@ pub struct RoutingSet {
     #[serde(default)]
     pub no_models_autoload: bool,
     pub profile_ids: Vec<String>,
+    #[serde(default)]
+    pub peers: Vec<SwapPeer>,
+    #[serde(default)]
+    pub concurrent_groups: Vec<SwapGroup>,
+}
+
+pub fn extract_normalized_host(endpoint_or_url: &str) -> Option<String> {
+    let mut s = endpoint_or_url.trim();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .or_else(|| s.strip_prefix("HTTP://"))
+        .or_else(|| s.strip_prefix("HTTPS://"))
+    {
+        s = rest;
+    }
+    if let Some((before_slash, _)) = s.split_once('/') {
+        s = before_slash;
+    }
+    if let Some((_, after_at)) = s.rsplit_once('@') {
+        s = after_at;
+    }
+    let host = if let Some(rest) = s.strip_prefix('[') {
+        rest.split_once(']')?.0.trim()
+    } else if let Some((h, _)) = s.rsplit_once(':') {
+        h.trim()
+    } else {
+        s.trim()
+    };
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
 }
 
 fn default_secondary_label() -> String {
@@ -712,6 +805,49 @@ impl StackConfig {
         Some(ep)
     }
 
+    pub fn detect_rpc_peer_collisions(&self, set: &RoutingSet) -> Vec<String> {
+        if set.mode == "llama_ini" || set.peers.is_empty() {
+            return Vec::new();
+        }
+        let mut rpc_hosts: Vec<(String, String)> = Vec::new();
+        for pid in &set.profile_ids {
+            let Some(prof) = self.find_profile(pid) else {
+                continue;
+            };
+            if let Some(ep) = self.effective_rpc_for_profile(&prof.single, None) {
+                if let Some(h) = extract_normalized_host(&ep) {
+                    rpc_hosts.push((prof.name.clone(), h));
+                }
+            }
+        }
+        if rpc_hosts.is_empty() {
+            return Vec::new();
+        }
+        let mut warnings = Vec::new();
+        for peer in &set.peers {
+            if !peer.enabled {
+                continue;
+            }
+            let Some(peer_host) = extract_normalized_host(&peer.proxy) else {
+                continue;
+            };
+            for (prof_name, rpc_host) in &rpc_hosts {
+                if rpc_host == &peer_host {
+                    let pname = if peer.name.trim().is_empty() {
+                        "unnamed-peer"
+                    } else {
+                        peer.name.trim()
+                    };
+                    warnings.push(format!(
+                        "RPC + Peer host collision on '{peer_host}': profile '{prof_name}' uses --rpc while peer '{pname}' targets {}. Running ggml-rpc-server and a peer server simultaneously on the same GPU causes VRAM contention.",
+                        peer.proxy.trim()
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
     pub fn load() -> Self {
         Self::load_with_hooks(None, None, None)
     }
@@ -852,6 +988,8 @@ impl Default for StackConfig {
                 mode: "llama_swap".to_string(),
                 no_models_autoload: false,
                 profile_ids: vec!["starter-model".to_string()],
+                peers: Vec::new(),
+                concurrent_groups: Vec::new(),
             }],
             groups,
         }
@@ -965,6 +1103,7 @@ fn migrate_from_v2(raw: &str) -> Result<StackConfig, String> {
                 help_key,
                 help_variant: String::new(),
                 ttl_seconds: 600,
+                check_endpoint: String::new(),
                 engine_label: p.engine_label.clone(),
                 engine_kind: p.engine_kind.clone(),
                 engine_dir_override: migrate_engine_path(&p.engine_dir_override),

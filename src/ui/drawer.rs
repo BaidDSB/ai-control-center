@@ -407,6 +407,20 @@ pub(crate) fn render_right_drawer(
                                             runtime::open_text_in_notepad(fname, &code);
                                         }
                                     });
+                                    if !is_ini {
+                                        let collisions = cfg.detect_rpc_peer_collisions(&set);
+                                        if !collisions.is_empty() {
+                                            ui.add_space(4.0);
+                                            for w in &collisions {
+                                                ui.label(
+                                                    egui::RichText::new(format!("Warning: {w}"))
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(warn_col),
+                                                );
+                                            }
+                                        }
+                                    }
                                     ui.add_space(6.0);
                                     let mut slice: &str = code.as_str();
                                     ui.add(

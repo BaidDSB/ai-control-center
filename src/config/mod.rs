@@ -94,6 +94,8 @@ mod tests {
             mode: "llama_ini".to_string(),
             no_models_autoload: false,
             profile_ids: vec![pid],
+            peers: Vec::new(),
+            concurrent_groups: Vec::new(),
         };
 
         let ini = cfg.build_routing_set_ini(&set);
@@ -231,5 +233,108 @@ mod tests {
 
         assert!(yaml_up.contains("--rpc 192.168.0.245:50052 --cache-ram 0"));
         assert!(!yaml_down.contains("--rpc"));
+    }
+
+    #[test]
+    fn yaml_emits_check_endpoint_groups_and_peers() {
+        let mut cfg = StackConfig::default();
+        cfg.groups[0].profiles[0].check_endpoint = "/v1/models".to_string();
+
+        let mut p2 = ModelProfile::default();
+        p2.id = "embed-small".to_string();
+        p2.name = "Embed".to_string();
+        p2.single.alias = "bge-embed".to_string();
+        p2.check_endpoint = "none".to_string();
+        cfg.groups[0].profiles.push(p2);
+
+        let mut set = cfg.routing_sets[0].clone();
+        set.profile_ids.push("embed-small".to_string());
+        set.concurrent_groups.push(SwapGroup {
+            name: "always-on".to_string(),
+            swap: false,
+            exclusive: false,
+            persistent: true,
+            members: vec!["starter-model".to_string(), "embed-small".to_string()],
+        });
+        set.peers.push(SwapPeer {
+            enabled: true,
+            name: "laptop-peer".to_string(),
+            proxy: "http://192.168.0.245:8080".to_string(),
+            api_key: "secret-key".to_string(),
+            models: vec!["qwen3.5-4b".to_string()],
+        });
+        set.peers.push(SwapPeer {
+            enabled: false,
+            name: "disabled-peer".to_string(),
+            proxy: "http://192.168.0.250:8080".to_string(),
+            api_key: String::new(),
+            models: vec!["ignored".to_string()],
+        });
+
+        let yaml = cfg.build_routing_set_yaml(&set);
+        assert!(yaml.contains("checkEndpoint: \"/v1/models\""));
+        assert!(yaml.contains("checkEndpoint: \"none\""));
+        assert!(yaml.contains("groups:\n  \"always-on\":\n    swap: false\n    exclusive: false\n    persistent: true\n    members:\n      - \"local-model\"\n      - \"bge-embed\""));
+        assert!(yaml.contains("peers:\n  \"laptop-peer\":\n    proxy: \"http://192.168.0.245:8080\"\n    apiKey: \"secret-key\"\n    models:\n      - \"qwen3.5-4b\""));
+        assert!(!yaml.contains("disabled-peer"));
+    }
+
+    #[test]
+    fn detect_rpc_peer_collisions_flags_same_host_only() {
+        let mut cfg = StackConfig::default();
+        cfg.secondary_node.enabled = true;
+        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.rpc_port = 50052;
+        cfg.groups[0].profiles[0].single.use_rpc = true;
+
+        let mut set = cfg.routing_sets[0].clone();
+        set.peers.push(SwapPeer {
+            enabled: true,
+            name: "laptop-same".to_string(),
+            proxy: "http://192.168.0.245:8080/v1".to_string(),
+            api_key: String::new(),
+            models: vec!["qwen3.5-4b".to_string()],
+        });
+        set.peers.push(SwapPeer {
+            enabled: true,
+            name: "other-box".to_string(),
+            proxy: "http://192.168.0.246:8080".to_string(),
+            api_key: String::new(),
+            models: vec!["other".to_string()],
+        });
+
+        let collisions = cfg.detect_rpc_peer_collisions(&set);
+        assert_eq!(collisions.len(), 1);
+        assert!(collisions[0].contains("192.168.0.245"));
+        assert!(collisions[0].contains("laptop-same"));
+    }
+
+    #[test]
+    fn extract_normalized_host_handles_urls_and_ipv6() {
+        assert_eq!(extract_normalized_host("192.168.0.245:50052").as_deref(), Some("192.168.0.245"));
+        assert_eq!(extract_normalized_host("http://192.168.0.245:8080/v1").as_deref(), Some("192.168.0.245"));
+        assert_eq!(extract_normalized_host("https://OpenRouter.ai/api").as_deref(), Some("openrouter.ai"));
+        assert_eq!(extract_normalized_host("http://[::1]:8080/").as_deref(), Some("::1"));
+        assert_eq!(extract_normalized_host("   "), None);
+    }
+
+    #[test]
+    fn disabled_peer_does_not_trigger_rpc_collision() {
+        let mut cfg = StackConfig::default();
+        cfg.secondary_node.enabled = true;
+        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.rpc_port = 50052;
+        cfg.groups[0].profiles[0].single.use_rpc = true;
+
+        let mut set = cfg.routing_sets[0].clone();
+        set.peers.push(SwapPeer {
+            enabled: false,
+            name: "laptop-off".to_string(),
+            proxy: "http://192.168.0.245:8080".to_string(),
+            api_key: String::new(),
+            models: vec![],
+        });
+
+        assert!(cfg.detect_rpc_peer_collisions(&set).is_empty());
     }
 }

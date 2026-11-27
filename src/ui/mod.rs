@@ -603,6 +603,9 @@ impl eframe::App for ControlCenterApp {
                                                             ui.label("Idle TTL (s):");
                                                             ui.add(egui::DragValue::new(&mut prof.ttl_seconds).range(0..=7200).speed(30))
                                                                 .on_hover_text("Auto-unload seconds in llama-swap (0 = never unload).");
+                                                            ui.label("Health:");
+                                                            pasteable_singleline(ui, &mut prof.check_endpoint, 95.0, "/health or none")
+                                                                .on_hover_text("Optional llama-swap checkEndpoint (leave blank for /health, or set 'none' / '/v1/models').");
                                                         });
                                                         ui.horizontal_wrapped(|ui| {
                                                             egui::ComboBox::from_id_salt("bind_saved_engine")

@@ -1,5 +1,5 @@
 use super::schema::{EnginePreset, ModelProfile, RoutingSet, StackConfig};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 impl ModelProfile {
@@ -152,6 +152,7 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
         out.push_str("healthCheckTimeout: 180\nlogToStdout: \"both\"\n\nmodels:\n");
 
         let mut used_names: HashSet<String> = HashSet::new();
+        let mut pid_to_key: HashMap<String, String> = HashMap::new();
         for pid in &set.profile_ids {
             let Some(prof) = self.find_profile(pid) else { continue; };
             let mut key = prof.swap_model_id();
@@ -159,6 +160,7 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
                 key = prof.id.clone();
             }
             used_names.insert(key.clone());
+            pid_to_key.insert(prof.id.clone(), key.clone());
 
             let resolved_rpc = self.effective_rpc_for_profile(&prof.single, rpc_reachable);
             let (cmd, env_vars) = prof.build_swap_cmd_and_env_with_engines_and_rpc(
@@ -171,6 +173,11 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
             if prof.ttl_seconds > 0 {
                 out.push_str(&format!("    ttl: {}\n", prof.ttl_seconds));
             }
+            let check_ep = prof.check_endpoint.trim();
+            if !check_ep.is_empty() {
+                let safe_ep = check_ep.replace('"', "\\\"");
+                out.push_str(&format!("    checkEndpoint: \"{safe_ep}\"\n"));
+            }
             if !env_vars.is_empty() {
                 out.push_str("    env:\n");
                 for ev in env_vars {
@@ -180,6 +187,85 @@ pub(crate) fn quote_for_swap(tok: &str) -> String {
             }
             out.push_str("    cmd: |\n");
             out.push_str(&format!("      {}\n\n", cmd));
+        }
+
+        // Optional concurrent groups (llama-swap `groups:`)
+        let mut emitted_groups = false;
+        for grp in &set.concurrent_groups {
+            let gname = grp.name.trim();
+            if gname.is_empty() {
+                continue;
+            }
+            let mut member_keys: Vec<String> = Vec::new();
+            for m in &grp.members {
+                let resolved = pid_to_key
+                    .get(m)
+                    .cloned()
+                    .or_else(|| if used_names.contains(m) { Some(m.clone()) } else { None });
+                if let Some(k) = resolved {
+                    if !member_keys.contains(&k) {
+                        member_keys.push(k);
+                    }
+                }
+            }
+            if member_keys.is_empty() {
+                continue;
+            }
+            if !emitted_groups {
+                out.push_str("groups:\n");
+                emitted_groups = true;
+            }
+            let safe_gn = gname.replace('"', "\\\"");
+            out.push_str(&format!("  \"{safe_gn}\":\n"));
+            out.push_str(&format!("    swap: {}\n", grp.swap));
+            out.push_str(&format!("    exclusive: {}\n", grp.exclusive));
+            out.push_str(&format!("    persistent: {}\n", grp.persistent));
+            out.push_str("    members:\n");
+            for mk in member_keys {
+                let safe_mk = mk.replace('"', "\\\"");
+                out.push_str(&format!("      - \"{safe_mk}\"\n"));
+            }
+            out.push('\n');
+        }
+
+        // Optional remote peers (llama-swap `peers:`)
+        let mut emitted_peers = false;
+        for peer in &set.peers {
+            if !peer.enabled {
+                continue;
+            }
+            let pname = peer.name.trim();
+            let proxy = peer.proxy.trim();
+            if pname.is_empty() || proxy.is_empty() {
+                continue;
+            }
+            if !emitted_peers {
+                out.push_str("peers:\n");
+                emitted_peers = true;
+            }
+            let safe_pn = pname.replace('"', "\\\"");
+            let safe_px = proxy.replace('"', "\\\"");
+            out.push_str(&format!("  \"{safe_pn}\":\n"));
+            out.push_str(&format!("    proxy: \"{safe_px}\"\n"));
+            let ak = peer.api_key.trim();
+            if !ak.is_empty() {
+                let safe_ak = ak.replace('"', "\\\"");
+                out.push_str(&format!("    apiKey: \"{safe_ak}\"\n"));
+            }
+            let models: Vec<&str> = peer
+                .models
+                .iter()
+                .map(|m| m.trim())
+                .filter(|m| !m.is_empty())
+                .collect();
+            if !models.is_empty() {
+                out.push_str("    models:\n");
+                for m in models {
+                    let safe_m = m.replace('"', "\\\"");
+                    out.push_str(&format!("      - \"{safe_m}\"\n"));
+                }
+            }
+            out.push('\n');
         }
         out
     }

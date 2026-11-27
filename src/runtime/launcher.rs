@@ -517,6 +517,9 @@ pub fn launch_routing_set(
     if let Some(note) = rpc_note {
         headers.push(note);
     }
+    for warn in cfg.detect_rpc_peer_collisions(set) {
+        headers.push(format!("[WARN] {warn}"));
+    }
     headers.push(format!("[LAUNCH] {swap_name} {}", args.join(" ")));
     spawn_monitored(
         swap_exe,

@@ -5,7 +5,7 @@ use super::theme::{
 };
 use crate::config::{
     guess_help_key, slugify, GgufInfo, ModelGroup,
-    ModelProfile, RoutingSet, StackConfig, ThemeMode,
+    ModelProfile, RoutingSet, StackConfig, SwapGroup, SwapPeer, ThemeMode,
 };
 use crate::platform;
 use eframe::egui;
@@ -105,8 +105,19 @@ pub(crate) fn render_left_workspace(
                             } else {
                                 "llama-swap"
                             };
+                            let peer_cnt = s.peers.iter().filter(|p| p.enabled).count();
+                            let grp_cnt = s.concurrent_groups.len();
+                            let mut meta_txt = format!("Router: {mtag}");
+                            if s.mode != "llama_ini" {
+                                if peer_cnt > 0 {
+                                    meta_txt.push_str(&format!(" | {peer_cnt} peer(s)"));
+                                }
+                                if grp_cnt > 0 {
+                                    meta_txt.push_str(&format!(" | {grp_cnt} group(s)"));
+                                }
+                            }
                             ui.label(
-                                egui::RichText::new(format!("Router: {mtag}"))
+                                egui::RichText::new(meta_txt)
                                     .size(10.5)
                                     .color(pal.accent),
                             );
@@ -151,6 +162,8 @@ pub(crate) fn render_left_workspace(
                                 mode: "llama_swap".to_string(),
                                 no_models_autoload: false,
                                 profile_ids: Vec::new(),
+                                peers: Vec::new(),
+                                concurrent_groups: Vec::new(),
                             });
                             cfg.selected_set_idx = cfg.routing_sets.len() - 1;
                             drafts.new_set_name.clear();
@@ -187,6 +200,20 @@ pub(crate) fn render_left_workspace(
 
                 // Edit Active Set Details (Edit Mode only)
                 if edit_mode {
+                    let sec_node_snap = cfg.secondary_node.clone();
+                    let linked_opts: Vec<(String, String)> = cfg
+                        .routing_sets
+                        .get(cfg.selected_set_idx)
+                        .map(|s| {
+                            s.profile_ids
+                                .iter()
+                                .filter_map(|pid| {
+                                    cfg.find_profile(pid).map(|p| (p.id.clone(), p.swap_model_id()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     if let Some(s_mut) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
@@ -225,6 +252,196 @@ pub(crate) fn render_left_workspace(
                                 "",
                             );
                         });
+
+                        if s_mut.mode != "llama_ini" {
+                            ui.add_space(4.0);
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!("Remote Peers (peers: {})", s_mut.peers.len()))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(pal.accent),
+                            )
+                            .id_salt(("cc_set_peers", &s_mut.id))
+                            .default_open(!s_mut.peers.is_empty())
+                            .show(ui, |ui| {
+                                let mut del_peer: Option<usize> = None;
+                                let mut peer_dirty = false;
+                                for (pi, peer) in s_mut.peers.iter_mut().enumerate() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.checkbox(&mut peer.enabled, "").changed() {
+                                            peer_dirty = true;
+                                        }
+                                        ui.label("Name:");
+                                        if pasteable_singleline(ui, &mut peer.name, 95.0, "peer-node").lost_focus() {
+                                            peer_dirty = true;
+                                        }
+                                        ui.label("Proxy:");
+                                        if pasteable_singleline(ui, &mut peer.proxy, 165.0, "http://192.168.x.x:8080").lost_focus() {
+                                            peer_dirty = true;
+                                        }
+                                        if ui.small_button("X").on_hover_text("Remove peer").clicked() {
+                                            del_peer = Some(pi);
+                                        }
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Models:");
+                                        let mut models_csv = peer.models.join(", ");
+                                        if pasteable_singleline(ui, &mut models_csv, 190.0, "model-a, model-b").lost_focus() {
+                                            peer.models = models_csv
+                                                .split(',')
+                                                .map(|s| s.trim().to_string())
+                                                .filter(|s| !s.is_empty())
+                                                .collect();
+                                            peer_dirty = true;
+                                        }
+                                        ui.label("Key:");
+                                        if pasteable_singleline(ui, &mut peer.api_key, 95.0, "optional").lost_focus() {
+                                            peer_dirty = true;
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                                if let Some(idx) = del_peer {
+                                    s_mut.peers.remove(idx);
+                                    peer_dirty = true;
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("+ Add Peer").clicked() {
+                                        let n = s_mut.peers.len() + 1;
+                                        s_mut.peers.push(SwapPeer {
+                                            enabled: true,
+                                            name: format!("peer-{n}"),
+                                            proxy: "http://192.168.0.245:8080".to_string(),
+                                            api_key: String::new(),
+                                            models: Vec::new(),
+                                        });
+                                        peer_dirty = true;
+                                    }
+                                    let sec_host = sec_node_snap.host.trim();
+                                    if !sec_host.is_empty() && sec_node_snap.peer_port > 0 {
+                                        let btn_lbl = format!(
+                                            "+ From {}",
+                                            if sec_node_snap.label.trim().is_empty() {
+                                                "Secondary Node"
+                                            } else {
+                                                sec_node_snap.label.trim()
+                                            }
+                                        );
+                                        if ui
+                                            .button(btn_lbl)
+                                            .on_hover_text("Create a peer targeting the centralized Secondary Node's Host + Peer Port")
+                                            .clicked()
+                                        {
+                                            let pname = slugify(if sec_node_snap.label.trim().is_empty() {
+                                                "secondary-node"
+                                            } else {
+                                                sec_node_snap.label.trim()
+                                            });
+                                            let proxy = if sec_host.contains(':') && !sec_host.starts_with('[') {
+                                                format!("http://[{sec_host}]:{}", sec_node_snap.peer_port)
+                                            } else {
+                                                format!("http://{sec_host}:{}", sec_node_snap.peer_port)
+                                            };
+                                            s_mut.peers.push(SwapPeer {
+                                                enabled: true,
+                                                name: pname,
+                                                proxy,
+                                                api_key: String::new(),
+                                                models: Vec::new(),
+                                            });
+                                            peer_dirty = true;
+                                        }
+                                    }
+                                });
+                                if peer_dirty {
+                                    outcome.save_note = Some("Updated Remote Peers.".to_string());
+                                }
+                            });
+
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!("Concurrent Groups (groups: {})", s_mut.concurrent_groups.len()))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(pal.accent),
+                            )
+                            .id_salt(("cc_set_groups", &s_mut.id))
+                            .default_open(!s_mut.concurrent_groups.is_empty())
+                            .show(ui, |ui| {
+                                let mut del_grp: Option<usize> = None;
+                                let mut grp_dirty = false;
+                                for (gi, grp) in s_mut.concurrent_groups.iter_mut().enumerate() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Group:");
+                                        if pasteable_singleline(ui, &mut grp.name, 110.0, "concurrent").lost_focus() {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.checkbox(&mut grp.swap, "swap")
+                                            .on_hover_text("false = keep members loaded concurrently; true = one member at a time.")
+                                            .changed()
+                                        {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.checkbox(&mut grp.exclusive, "exclusive")
+                                            .on_hover_text("true = loading this group unloads other groups.")
+                                            .changed()
+                                        {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.checkbox(&mut grp.persistent, "persistent")
+                                            .on_hover_text("true = other groups will not unload members of this group.")
+                                            .changed()
+                                        {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.small_button("X").on_hover_text("Remove group").clicked() {
+                                            del_grp = Some(gi);
+                                        }
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("Members:").size(10.5).color(pal.muted));
+                                        for (pid, mkey) in &linked_opts {
+                                            let is_mem = grp.members.iter().any(|m| m == pid || m == mkey);
+                                            let pill = egui::Button::new(
+                                                egui::RichText::new(mkey).size(10.5).color(if is_mem {
+                                                    pal.accent_text
+                                                } else {
+                                                    pal.btn_idle_text
+                                                }),
+                                            )
+                                            .fill(if is_mem { pal.accent } else { pal.btn_idle })
+                                            .corner_radius(egui::CornerRadius::same(6));
+                                            if ui.add(pill).clicked() {
+                                                if is_mem {
+                                                    grp.members.retain(|m| m != pid && m != mkey);
+                                                } else {
+                                                    grp.members.push(pid.clone());
+                                                }
+                                                grp_dirty = true;
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                                if let Some(idx) = del_grp {
+                                    s_mut.concurrent_groups.remove(idx);
+                                    grp_dirty = true;
+                                }
+                                if ui.button("+ Add Concurrent Group").clicked() {
+                                    let n = s_mut.concurrent_groups.len() + 1;
+                                    s_mut.concurrent_groups.push(SwapGroup {
+                                        name: format!("concurrent-{n}"),
+                                        swap: false,
+                                        exclusive: false,
+                                        persistent: false,
+                                        members: Vec::new(),
+                                    });
+                                    grp_dirty = true;
+                                }
+                                if grp_dirty {
+                                    outcome.save_note = Some("Updated Concurrent Groups.".to_string());
+                                }
+                            });
+                        }
                     }
                 }
 
@@ -241,6 +458,23 @@ pub(crate) fn render_left_workspace(
                     .unwrap_or_default();
 
                 if let Some(active_set) = cfg.routing_sets.get(cfg.selected_set_idx).cloned() {
+                    let collisions = cfg.detect_rpc_peer_collisions(&active_set);
+                    if !collisions.is_empty() {
+                        let warn_col = if is_light {
+                            egui::Color32::from_rgb(168, 98, 8)
+                        } else {
+                            egui::Color32::from_rgb(251, 191, 36)
+                        };
+                        for w in &collisions {
+                            ui.label(
+                                egui::RichText::new(format!("Warning: {w}"))
+                                    .size(10.5)
+                                    .strong()
+                                    .color(warn_col),
+                            );
+                        }
+                        ui.add_space(3.0);
+                    }
                     if !edit_mode && !active_set.description.is_empty() {
                         ui.add(
                             egui::Label::new(
