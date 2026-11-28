@@ -80,7 +80,7 @@ pub fn resolve_config_dir(config_filename: &str) -> PathBuf {
             .unwrap_or_else(|| dir.clone());
         let cfg_dir = base.join("ai-control-center");
         let _ = fs::create_dir_all(&cfg_dir);
-        return cfg_dir;
+        cfg_dir
     }
 
     #[cfg(windows)]
@@ -254,12 +254,12 @@ pub fn read_from_clipboard() -> Option<String> {
             ("xsel", &["--clipboard", "--output"]),
         ];
         for (bin, args) in tools {
-            if let Ok(out) = Command::new(bin).args(*args).output() {
-                if out.status.success() {
-                    let s = String::from_utf8_lossy(&out.stdout).to_string();
-                    if !s.is_empty() {
-                        return Some(s);
-                    }
+            if let Ok(out) = Command::new(bin).args(*args).output()
+                && out.status.success()
+            {
+                let s = String::from_utf8_lossy(&out.stdout).to_string();
+                if !s.is_empty() {
+                    return Some(s);
                 }
             }
         }
@@ -515,17 +515,16 @@ pub fn is_pid_running_as(pid: u32, expected_exe: &str) -> bool {
     if !std::path::Path::new(&proc_dir).exists() {
         return false;
     }
-    if let Ok(stat) = std::fs::read_to_string(format!("{proc_dir}/stat")) {
-        if let Some(after) = stat.rfind(')').map(|i| &stat[i + 1..]) {
-            if after.split_whitespace().next() == Some("Z") {
-                return false;
-            }
-        }
+    if let Ok(stat) = std::fs::read_to_string(format!("{proc_dir}/stat"))
+        && let Some(after) = stat.rfind(')').map(|i| &stat[i + 1..])
+        && after.split_whitespace().next() == Some("Z")
+    {
+        return false;
     }
-    if let Ok(comm) = std::fs::read_to_string(format!("{proc_dir}/comm")) {
-        if exe_name_matches(&comm, expected_exe) {
-            return true;
-        }
+    if let Ok(comm) = std::fs::read_to_string(format!("{proc_dir}/comm"))
+        && exe_name_matches(&comm, expected_exe)
+    {
+        return true;
     }
     if let Ok(raw) = std::fs::read(format!("{proc_dir}/cmdline")) {
         for arg in raw.split(|&b| b == 0).take(2) {
@@ -536,10 +535,9 @@ pub fn is_pid_running_as(pid: u32, expected_exe: &str) -> bool {
             if let Some(fname) = std::path::Path::new(s.as_ref())
                 .file_name()
                 .and_then(|n| n.to_str())
+                && exe_name_matches(fname, expected_exe)
             {
-                if exe_name_matches(fname, expected_exe) {
-                    return true;
-                }
+                return true;
             }
         }
     }

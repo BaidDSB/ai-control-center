@@ -1,3 +1,4 @@
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrayAction {
     Show,
