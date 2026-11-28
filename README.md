@@ -1,4 +1,4 @@
-# AI Control Center (v1.0)
+# AI Control Center (v1.2)
 
 A fast, native desktop control panel for running local Large Language Models (LLMs) on **Windows** and **Linux**.
 
@@ -33,7 +33,11 @@ A fast, native desktop control panel for running local Large Language Models (LL
 - **Multi-Model Routing Sets (`llama-swap` + `llama.cpp` Router):** Group profiles—even across completely different engines—into one hot-swapping Routing Set via auto-generated `llama-swap.yaml` (with absolute path resolution and automatic `${PORT}` routing) or native `llama.cpp` `models.ini`.
 - **Live Color-Coded CLI / YAML / INI Diff Viewer:** Every toggle updates a real-time command and config preview (added flags in green, modified values in amber, removed flags in red) so you always see the exact arguments before launching.
 - **Direct Modern Tuning Controls:** First-class GUI controls for flags rarely exposed in mainstream desktop runners—including MoE expert offloading and expert VRAM caching, speculative/MTP decoding, KV cache quantization, DeltaNet context checkpoints, DRY sampling, per-process `GGML_CUDA_NO_PINNED=1`, and LAN `--rpc` GPU pooling—paired with optional plain-English hints and hover tooltips.
-- **Instant GGUF Header Inspection:** Reads model size, architecture, layer count, context length, and MoE expert count directly from `.gguf` headers without loading weights into memory.
+- **Instant GGUF Header Inspection & Pre-Launch VRAM Estimator:** Reads model size, architecture, layer count, context length, attention KV head dimensions, and MoE expert count directly from `.gguf` headers—estimating GPU VRAM and RAM offload before launch against your detected GPU capacity.
+- **Live Dedicated + Shared GPU Telemetry & Soft Unload:** Polls live dedicated VRAM, Windows Shared GPU memory (WDDM PDH) / Linux GTT, and `llama-swap` `/running` active models in the top bar—with one-click **Soft Unload** (`/unload`) and **Swap /ui** access.
+- **Centralized Secondary Node & Zero-Wait Auto-RPC Fallback:** Configure a LAN secondary node once in **Setup** (host, RPC port, peer port, live TCP check, and **Auto** vs. **Strict** policy). When unreachable under Auto policy, `--rpc` is omitted automatically instead of stalling startup.
+- **Full `llama-swap` Peers, Concurrent Groups & Health Checks:** Configure remote `peers:` (with one-click **+ From Secondary Node**), concurrent `groups:` (`swap` / `exclusive` / `persistent`), per-profile `checkEndpoint`, and automatic same-IP **RPC + Peer collision warnings**.
+- **Everyday Productivity:** Instant sidebar search across families/profiles, path-stripped portable `.toml` profile Export/Import, and opt-in **Close to System Tray** on Windows.
 - **Non-Destructive Live Consoles & Auto Error Capture:** Independent floating console windows for your engine and web frontend can be closed and reopened at any time without interrupting running servers, while critical errors (OOM, CUDA faults, invalid flags, missing custom ports) are automatically surfaced in a dedicated Error Log.
 - **Clean Separation of Daily Use & Configuration:** Toggle **Edit Mode** to access the highlighted **SETUP** panel for paths, engines, frontend, and profiles; toggle it off for a clutter-free daily launcher with customizable themes and accent colors.
 
@@ -69,11 +73,11 @@ AI Control Center is available in two free editions—clearly labeled as **`AI C
 Download the archive for your OS and edition from the [Releases](https://github.com/BaidDSB/ai-control-center/releases) page:
 
 - **Windows (64-bit):**
-  - `ai-control-center-core-v1.0.0-win64.zip` (`AI Control Center Core v1.0.0.exe`)
-  - `ai-control-center-plus-v1.0.0-win64.zip` (`AI Control Center Plus v1.0.0.exe` + `help.example.md`)
+  - `ai-control-center-core-v1.2.0-win64.zip` (`AI Control Center Core v1.2.0.exe`)
+  - `ai-control-center-plus-v1.2.0-win64.zip` (`AI Control Center Plus v1.2.0.exe` + `help.example.md`)
 - **Linux (x64, Ubuntu 24.04 / `glibc 2.39`+):**
-  - `ai-control-center-core-v1.0.0-linux-x64.tar.gz` (`ai-control-center-core-v1.0.0`)
-  - `ai-control-center-plus-v1.0.0-linux-x64.tar.gz` (`ai-control-center-plus-v1.0.0` + `help.example.md`)
+  - `ai-control-center-core-v1.2.0-linux-x64.tar.gz` (`ai-control-center-core-v1.2.0`)
+  - `ai-control-center-plus-v1.2.0-linux-x64.tar.gz` (`ai-control-center-plus-v1.2.0` + `help.example.md`)
 
 Extract to any writable folder (for example `C:\LocalAI\` or `~/ai-control-center/`).
 
@@ -93,7 +97,7 @@ Extract to any writable folder (for example `C:\LocalAI\` or `~/ai-control-cente
 
 ### 3. Initial Setup
 
-1. Launch **AI Control Center Core v1.0** or **Plus v1.0**.
+1. Launch **AI Control Center Core v1.2** or **Plus v1.2**.
 2. Click **`Edit Mode`** in the top bar.
 3. On a fresh install, the highlighted **`SETUP: Paths, Engines & Frontend`** (Core) or **`SETUP: Paths, Engines, Frontend & Plus`** (Plus) card opens automatically in the left sidebar. Set:
    - Your **Models Folder** (scanned recursively for `.gguf` files).
@@ -257,6 +261,7 @@ serve --model "{model}" --ctx {ctx} --addr {addr}
 - **Load Mode (`-lm`):** Selects weight loading behavior (`auto`, `mmap`, `none`, `mlock`, `dio`).
 - **KV Types (`turbo2`, `turbo3`, `turbo4`):** Supported on TurboQuant-patched `llama.cpp` forks; mainline `llama.cpp` uses `f16`, `bf16`, `f8_e4m3`, `q8_0`, `q4_0`, or `iq4_nl`.
 - **Speculative Decoding (`--spec-type`, `--spec-draft-n-max`, `--spec-draft-p-min`, `--model-draft`):** Supports `draft-mtp` (built-in or external draft `.gguf`), `ngram-simple`, and `ngram-mod` when `parallel = 1`.
+- **Two-Way Simple <-> Advanced CLI Sync:** Switching between Simple controls and raw Manual Flags keeps both sides synchronized in real time, parsing recognized flags back into Simple fields and preserving unrecognized flags in **Extra Args**.
 - **Diagnostics (`--metrics`, `-lv`, `--timeout`):** Enables `/metrics`, configures log verbosity (`-lv 0..4`), and adjusts HTTP timeouts for long prompt prefills.
 - **Process Environment Isolation:** Enabling **No CUDA Pinned** injects `GGML_CUDA_NO_PINNED=1` solely into the spawned backend process without modifying OS environment variables. Companion Service scripts on Windows run with `CI=1` so scripts containing `if not defined CI pause` exit cleanly when launched headless.
 
@@ -298,7 +303,7 @@ Global notes displayed for any profile using llama.cpp.
 - **Custom engine blocked before `llama-swap` launch (`no launch flags` / missing `${PORT}`):** Open **Edit Mode → `SETUP` → Saved Engines** and set `Args:` on your custom engine (or set **Extra / Custom Flags** on the profile) including `{model}` and `{port}` or `{addr}`, e.g. `serve --model {model} --ctx {ctx} --addr {addr}`.
 - **`GLIBC` version error on Linux:** Pre-built Linux binaries are compiled on **Ubuntu 24.04 LTS (`glibc 2.39`)**. Older distributions below `glibc 2.39` (such as Ubuntu 22.04 or Debian 12) are not currently supported.
 - **Copy / Paste buttons inactive on Linux:** Install `wl-clipboard` (Wayland) or `xclip` / `xsel` (X11).
-- **Blank window inside a Linux VM:** Enable **3D Graphics Acceleration** in VM display settings, or launch with `LIBGL_ALWAYS_SOFTWARE=1 ./ai-control-center-core-v1.0.0`.
+- **Blank window inside a Linux VM:** Enable **3D Graphics Acceleration** in VM display settings, or launch with `LIBGL_ALWAYS_SOFTWARE=1 ./ai-control-center-core-v1.2.0`.
 - **Closed console window:** Closing a console window does not stop the backend or frontend; click **`Engine Console`** or **`Frontend Console`** in the header to reopen it.
 
 ## License

@@ -1,6 +1,7 @@
 use super::theme::{engine_badge_color_for, UiPalette};
 use crate::config::{
-    compute_cli_diff, guess_help_key, DiffKind, HelpMap, ModelProfile, StackConfig, ThemeMode,
+    compute_cli_diff_with_rpc, guess_help_key, DiffKind, HelpMap, ModelProfile, StackConfig,
+    ThemeMode,
 };
 use crate::runtime;
 use eframe::egui;
@@ -27,10 +28,12 @@ pub(crate) fn build_diff_layout_job(
     current: &ModelProfile,
     saved: &ModelProfile,
     models_dir: &str,
+    cur_rpc: Option<&str>,
+    sav_rpc: Option<&str>,
     theme_mode: ThemeMode,
 ) -> (egui::text::LayoutJob, Vec<String>, usize) {
     use egui::{Color32, FontId, TextFormat};
-    let diff = compute_cli_diff(current, saved, models_dir);
+    let diff = compute_cli_diff_with_rpc(current, saved, models_dir, cur_rpc, sav_rpc);
     let mut job = egui::text::LayoutJob::default();
 
     let (base_col, add_col, mod_col, dim_col) = if theme_mode == ThemeMode::Light {
@@ -404,6 +407,20 @@ pub(crate) fn render_right_drawer(
                                             runtime::open_text_in_notepad(fname, &code);
                                         }
                                     });
+                                    if !is_ini {
+                                        let collisions = cfg.detect_rpc_peer_collisions(&set);
+                                        if !collisions.is_empty() {
+                                            ui.add_space(4.0);
+                                            for w in &collisions {
+                                                ui.label(
+                                                    egui::RichText::new(format!("Warning: {w}"))
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(warn_col),
+                                                );
+                                            }
+                                        }
+                                    }
                                     ui.add_space(6.0);
                                     let mut slice: &str = code.as_str();
                                     ui.add(
@@ -418,14 +435,18 @@ pub(crate) fn render_right_drawer(
                                 if let Some((_, prof)) = sel_pair {
                                     let saved_prof =
                                         saved_cfg.find_profile(&prof.id).unwrap_or(&prof);
+                                    let cur_rpc = cfg.effective_rpc_for_profile(&prof.single, None);
+                                    let sav_rpc = saved_cfg.effective_rpc_for_profile(&saved_prof.single, None);
                                     let (diff_job, removed_items, change_count) =
                                         build_diff_layout_job(
                                             &prof,
                                             saved_prof,
                                             &cfg.models_dir,
+                                            cur_rpc.as_deref(),
+                                            sav_rpc.as_deref(),
                                             cfg.theme_mode,
                                         );
-                                    let full_code = prof.code_text(&cfg.models_dir);
+                                    let full_code = prof.code_text_with_rpc(&cfg.models_dir, cur_rpc.as_deref());
 
                                     ui.horizontal_wrapped(|ui| {
                                         if change_count > 0 {

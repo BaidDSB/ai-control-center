@@ -1,18 +1,18 @@
+use super::setup::render_setup_card;
 use super::theme::{
-    default_engine_rgb, engine_badge_color_for, pasteable_singleline, themed_card, UiPalette,
+    engine_badge_color_for, file_dialog_in, pasteable_singleline, themed_card, UiPalette,
     ENGINE_COLOR_PALETTE,
 };
 use crate::config::{
-    self, guess_help_key, scan_gguf_models, slugify, EnginePreset, GgufInfo, ModelGroup,
-    ModelProfile, RoutingSet, StackConfig, ThemeMode,
+    guess_help_key, profile_matches_search, slugify, GgufInfo, ModelGroup, ModelProfile,
+    RoutingSet, StackConfig, SwapGroup, SwapPeer, ThemeMode,
 };
 use crate::platform;
 use eframe::egui;
-use rfd::FileDialog;
 use std::collections::HashMap;
-use std::path::Path;
 
 pub(crate) struct SidebarDrafts {
+    pub search_query: String,
     pub new_set_name: String,
     pub new_group_name: String,
     pub new_profile_name: String,
@@ -22,11 +22,13 @@ pub(crate) struct SidebarDrafts {
     pub new_engine_exe: String,
     pub new_engine_args: String,
     pub new_engine_color: [u8; 3],
+    pub rpc_test_status: Option<(bool, String)>,
 }
 
 impl SidebarDrafts {
     pub(crate) fn new() -> Self {
         Self {
+            search_query: String::new(),
             new_set_name: String::new(),
             new_group_name: String::new(),
             new_profile_name: String::new(),
@@ -36,6 +38,7 @@ impl SidebarDrafts {
             new_engine_exe: platform::default_exe_name("llama-server"),
             new_engine_args: String::new(),
             new_engine_color: ENGINE_COLOR_PALETTE[1],
+            rpc_test_status: None,
         }
     }
 }
@@ -104,8 +107,19 @@ pub(crate) fn render_left_workspace(
                             } else {
                                 "llama-swap"
                             };
+                            let peer_cnt = s.peers.iter().filter(|p| p.enabled).count();
+                            let grp_cnt = s.concurrent_groups.len();
+                            let mut meta_txt = format!("Router: {mtag}");
+                            if s.mode != "llama_ini" {
+                                if peer_cnt > 0 {
+                                    meta_txt.push_str(&format!(" | {peer_cnt} peer(s)"));
+                                }
+                                if grp_cnt > 0 {
+                                    meta_txt.push_str(&format!(" | {grp_cnt} group(s)"));
+                                }
+                            }
                             ui.label(
-                                egui::RichText::new(format!("Router: {mtag}"))
+                                egui::RichText::new(meta_txt)
                                     .size(10.5)
                                     .color(pal.accent),
                             );
@@ -150,6 +164,8 @@ pub(crate) fn render_left_workspace(
                                 mode: "llama_swap".to_string(),
                                 no_models_autoload: false,
                                 profile_ids: Vec::new(),
+                                peers: Vec::new(),
+                                concurrent_groups: Vec::new(),
                             });
                             cfg.selected_set_idx = cfg.routing_sets.len() - 1;
                             drafts.new_set_name.clear();
@@ -186,6 +202,20 @@ pub(crate) fn render_left_workspace(
 
                 // Edit Active Set Details (Edit Mode only)
                 if edit_mode {
+                    let sec_node_snap = cfg.secondary_node.clone();
+                    let linked_opts: Vec<(String, String)> = cfg
+                        .routing_sets
+                        .get(cfg.selected_set_idx)
+                        .map(|s| {
+                            s.profile_ids
+                                .iter()
+                                .filter_map(|pid| {
+                                    cfg.find_profile(pid).map(|p| (p.id.clone(), p.swap_model_id()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+
                     if let Some(s_mut) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                         ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
@@ -224,6 +254,196 @@ pub(crate) fn render_left_workspace(
                                 "",
                             );
                         });
+
+                        if s_mut.mode != "llama_ini" {
+                            ui.add_space(4.0);
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!("Remote Peers (peers: {})", s_mut.peers.len()))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(pal.accent),
+                            )
+                            .id_salt(("cc_set_peers", &s_mut.id))
+                            .default_open(!s_mut.peers.is_empty())
+                            .show(ui, |ui| {
+                                let mut del_peer: Option<usize> = None;
+                                let mut peer_dirty = false;
+                                for (pi, peer) in s_mut.peers.iter_mut().enumerate() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.checkbox(&mut peer.enabled, "").changed() {
+                                            peer_dirty = true;
+                                        }
+                                        ui.label("Name:");
+                                        if pasteable_singleline(ui, &mut peer.name, 95.0, "peer-node").lost_focus() {
+                                            peer_dirty = true;
+                                        }
+                                        ui.label("Proxy:");
+                                        if pasteable_singleline(ui, &mut peer.proxy, 165.0, "http://10.0.0.20:8080").lost_focus() {
+                                            peer_dirty = true;
+                                        }
+                                        if ui.small_button("X").on_hover_text("Remove peer").clicked() {
+                                            del_peer = Some(pi);
+                                        }
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Models:");
+                                        let mut models_csv = peer.models.join(", ");
+                                        if pasteable_singleline(ui, &mut models_csv, 190.0, "model-a, model-b").lost_focus() {
+                                            peer.models = models_csv
+                                                .split(',')
+                                                .map(|s| s.trim().to_string())
+                                                .filter(|s| !s.is_empty())
+                                                .collect();
+                                            peer_dirty = true;
+                                        }
+                                        ui.label("Key:");
+                                        if pasteable_singleline(ui, &mut peer.api_key, 95.0, "optional").lost_focus() {
+                                            peer_dirty = true;
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                                if let Some(idx) = del_peer {
+                                    s_mut.peers.remove(idx);
+                                    peer_dirty = true;
+                                }
+                                ui.horizontal_wrapped(|ui| {
+                                    if ui.button("+ Add Peer").clicked() {
+                                        let n = s_mut.peers.len() + 1;
+                                        s_mut.peers.push(SwapPeer {
+                                            enabled: true,
+                                            name: format!("peer-{n}"),
+                                            proxy: "http://10.0.0.20:8080".to_string(),
+                                            api_key: String::new(),
+                                            models: Vec::new(),
+                                        });
+                                        peer_dirty = true;
+                                    }
+                                    let sec_host = sec_node_snap.host.trim();
+                                    if !sec_host.is_empty() && sec_node_snap.peer_port > 0 {
+                                        let btn_lbl = format!(
+                                            "+ From {}",
+                                            if sec_node_snap.label.trim().is_empty() {
+                                                "Secondary Node"
+                                            } else {
+                                                sec_node_snap.label.trim()
+                                            }
+                                        );
+                                        if ui
+                                            .button(btn_lbl)
+                                            .on_hover_text("Create a peer targeting the centralized Secondary Node's Host + Peer Port")
+                                            .clicked()
+                                        {
+                                            let pname = slugify(if sec_node_snap.label.trim().is_empty() {
+                                                "secondary-node"
+                                            } else {
+                                                sec_node_snap.label.trim()
+                                            });
+                                            let proxy = if sec_host.contains(':') && !sec_host.starts_with('[') {
+                                                format!("http://[{sec_host}]:{}", sec_node_snap.peer_port)
+                                            } else {
+                                                format!("http://{sec_host}:{}", sec_node_snap.peer_port)
+                                            };
+                                            s_mut.peers.push(SwapPeer {
+                                                enabled: true,
+                                                name: pname,
+                                                proxy,
+                                                api_key: String::new(),
+                                                models: Vec::new(),
+                                            });
+                                            peer_dirty = true;
+                                        }
+                                    }
+                                });
+                                if peer_dirty {
+                                    outcome.save_note = Some("Updated Remote Peers.".to_string());
+                                }
+                            });
+
+                            egui::CollapsingHeader::new(
+                                egui::RichText::new(format!("Concurrent Groups (groups: {})", s_mut.concurrent_groups.len()))
+                                    .size(11.5)
+                                    .strong()
+                                    .color(pal.accent),
+                            )
+                            .id_salt(("cc_set_groups", &s_mut.id))
+                            .default_open(!s_mut.concurrent_groups.is_empty())
+                            .show(ui, |ui| {
+                                let mut del_grp: Option<usize> = None;
+                                let mut grp_dirty = false;
+                                for (gi, grp) in s_mut.concurrent_groups.iter_mut().enumerate() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("Group:");
+                                        if pasteable_singleline(ui, &mut grp.name, 110.0, "concurrent").lost_focus() {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.checkbox(&mut grp.swap, "swap")
+                                            .on_hover_text("false = keep members loaded concurrently; true = one member at a time.")
+                                            .changed()
+                                        {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.checkbox(&mut grp.exclusive, "exclusive")
+                                            .on_hover_text("true = loading this group unloads other groups.")
+                                            .changed()
+                                        {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.checkbox(&mut grp.persistent, "persistent")
+                                            .on_hover_text("true = other groups will not unload members of this group.")
+                                            .changed()
+                                        {
+                                            grp_dirty = true;
+                                        }
+                                        if ui.small_button("X").on_hover_text("Remove group").clicked() {
+                                            del_grp = Some(gi);
+                                        }
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(egui::RichText::new("Members:").size(10.5).color(pal.muted));
+                                        for (pid, mkey) in &linked_opts {
+                                            let is_mem = grp.members.iter().any(|m| m == pid || m == mkey);
+                                            let pill = egui::Button::new(
+                                                egui::RichText::new(mkey).size(10.5).color(if is_mem {
+                                                    pal.accent_text
+                                                } else {
+                                                    pal.btn_idle_text
+                                                }),
+                                            )
+                                            .fill(if is_mem { pal.accent } else { pal.btn_idle })
+                                            .corner_radius(egui::CornerRadius::same(6));
+                                            if ui.add(pill).clicked() {
+                                                if is_mem {
+                                                    grp.members.retain(|m| m != pid && m != mkey);
+                                                } else {
+                                                    grp.members.push(pid.clone());
+                                                }
+                                                grp_dirty = true;
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                }
+                                if let Some(idx) = del_grp {
+                                    s_mut.concurrent_groups.remove(idx);
+                                    grp_dirty = true;
+                                }
+                                if ui.button("+ Add Concurrent Group").clicked() {
+                                    let n = s_mut.concurrent_groups.len() + 1;
+                                    s_mut.concurrent_groups.push(SwapGroup {
+                                        name: format!("concurrent-{n}"),
+                                        swap: false,
+                                        exclusive: false,
+                                        persistent: false,
+                                        members: Vec::new(),
+                                    });
+                                    grp_dirty = true;
+                                }
+                                if grp_dirty {
+                                    outcome.save_note = Some("Updated Concurrent Groups.".to_string());
+                                }
+                            });
+                        }
                     }
                 }
 
@@ -240,6 +460,23 @@ pub(crate) fn render_left_workspace(
                     .unwrap_or_default();
 
                 if let Some(active_set) = cfg.routing_sets.get(cfg.selected_set_idx).cloned() {
+                    let collisions = cfg.detect_rpc_peer_collisions(&active_set);
+                    if !collisions.is_empty() {
+                        let warn_col = if is_light {
+                            egui::Color32::from_rgb(168, 98, 8)
+                        } else {
+                            egui::Color32::from_rgb(251, 191, 36)
+                        };
+                        for w in &collisions {
+                            ui.label(
+                                egui::RichText::new(format!("Warning: {w}"))
+                                    .size(10.5)
+                                    .strong()
+                                    .color(warn_col),
+                            );
+                        }
+                        ui.add_space(3.0);
+                    }
                     if !edit_mode && !active_set.description.is_empty() {
                         ui.add(
                             egui::Label::new(
@@ -354,28 +591,25 @@ pub(crate) fn render_left_workspace(
                         });
                 }
 
-                if let Some(pid) = jump_to_pid {
-                    if let Some((gi, pi)) = cfg.find_profile_pos(&pid) {
+                if let Some(pid) = jump_to_pid
+                    && let Some((gi, pi)) = cfg.find_profile_pos(&pid) {
                         cfg.selected_group_idx = gi;
                         cfg.selected_profile_idx = pi;
                         if let Some(p) = cfg.groups.get(gi).and_then(|g| g.profiles.get(pi)) {
                             *status_msg = format!("Selected '{}' from Routing Set.", p.name);
                         }
                     }
-                }
-                if let Some(li) = unlink_req {
-                    if let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
+                if let Some(li) = unlink_req
+                    && let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                         set.profile_ids.remove(li);
                         outcome.save_note = Some("Unlinked profile from Routing Set.".to_string());
                     }
-                }
-                if let Some((a, b)) = move_link_req {
-                    if let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
+                if let Some((a, b)) = move_link_req
+                    && let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                         set.profile_ids.swap(a, b);
                         outcome.save_note =
                             Some("Reordered linked profiles in Routing Set.".to_string());
                     }
-                }
             });
 
             ui.add_space(8.0);
@@ -403,496 +637,35 @@ pub(crate) fn render_left_workspace(
                                 .show(ui, |ui| {
                                     // EDIT MODE: PATHS & SAVED ENGINES
                                     if edit_mode {
-                                        let needs_setup = cfg.models_dir.trim().is_empty()
-                                            && cfg.llama_dir.trim().is_empty();
-                                        let setup_hdr_txt = if cfg!(feature = "plus") {
-                                            "SETUP: Paths, Engines, Frontend & Plus"
-                                        } else {
-                                            "SETUP: Paths, Engines & Frontend"
-                                        };
-                                        egui::Frame::new()
-                                            .fill(pal.item_sel_bg)
-                                            .stroke(egui::Stroke::new(1.5, pal.edit_hl))
-                                            .corner_radius(egui::CornerRadius::same(8))
-                                            .inner_margin(egui::Margin::same(8))
-                                            .show(ui, |ui| {
-                                                ui.set_min_width(ui.available_width());
-                                                egui::CollapsingHeader::new(
-                                                    egui::RichText::new(setup_hdr_txt)
-                                                        .size(12.0)
-                                                        .strong()
-                                                        .color(pal.edit_hl),
-                                                )
-                                                .default_open(needs_setup)
-                                                .show(ui, |ui| {
-                                                    ui.label("llama-swap (Router):");
-                                                    ui.horizontal(|ui| {
-                                                        pasteable_singleline(ui, &mut cfg.llama_swap_exe, 185.0, "");
-                                                        if ui.button("...").clicked() {
-                                                            let mut dlg = FileDialog::new();
-                                                            if cfg!(windows) {
-                                                                dlg = dlg.add_filter("Executable", &["exe"]);
-                                                            }
-                                                            if let Some(p) = dlg.pick_file() {
-                                                                cfg.llama_swap_exe = p.to_string_lossy().to_string();
-                                                                outcome.save_note = Some("Updated llama-swap path.".to_string());
-                                                            }
-                                                        }
-                                                    });
-
-                                                    ui.label("Global Engines Folder:");
-                                                    ui.horizontal(|ui| {
-                                                        pasteable_singleline(ui, &mut cfg.llama_dir, 185.0, "");
-                                                        if ui.button("...").clicked() {
-                                                            if let Some(p) = FileDialog::new().pick_folder() {
-                                                                cfg.llama_dir = p.to_string_lossy().to_string();
-                                                                outcome.save_note = Some("Updated Global Engines folder.".to_string());
-                                                            }
-                                                        }
-                                                    });
-
-                                                    if cfg!(feature = "plus") {
-                                                        ui.label("External help.md:");
-                                                        ui.horizontal(|ui| {
-                                                            pasteable_singleline(ui, &mut cfg.help_md_path, 185.0, "");
-                                                            if ui.button("...").clicked() {
-                                                                if let Some(p) = FileDialog::new()
-                                                                    .add_filter("Markdown", &["md", "txt"])
-                                                                    .pick_file()
-                                                                {
-                                                                    cfg.help_md_path = p.to_string_lossy().to_string();
-                                                                    outcome.reload_help = true;
-                                                                    outcome.save_note = Some("Updated external help.md path.".to_string());
-                                                                }
-                                                            }
-                                                        });
-                                                        ui.separator();
-                                                        egui::CollapsingHeader::new(
-                                                            egui::RichText::new("Companion Services")
-                                                                .size(10.5)
-                                                                .strong()
-                                                                .color(pal.edit_hl),
-                                                        )
-                                                        .default_open(false)
-                                                        .show(ui, |ui| {
-                                                            let mut del_svc: Option<usize> = None;
-                                                            let mut svc_dirty = false;
-                                                            for (si, svc) in cfg.companion_services.iter_mut().enumerate() {
-                                                                egui::Frame::new()
-                                                                    .fill(pal.item_bg)
-                                                                    .stroke(egui::Stroke::new(1.0, pal.item_border))
-                                                                    .corner_radius(egui::CornerRadius::same(6))
-                                                                    .inner_margin(egui::Margin::same(6))
-                                                                    .show(ui, |ui| {
-                                                                        ui.horizontal(|ui| {
-                                                                            if ui.checkbox(&mut svc.enabled, "").on_hover_text("Show toggle pill in header").changed() {
-                                                                                svc_dirty = true;
-                                                                            }
-                                                                            if pasteable_singleline(ui, &mut svc.name, 105.0, "Name (e.g. SearXNG)").lost_focus() {
-                                                                                svc_dirty = true;
-                                                                            }
-                                                                            ui.label("Port:");
-                                                                            if ui.add(egui::DragValue::new(&mut svc.check_port).speed(1.0)).changed() {
-                                                                                svc_dirty = true;
-                                                                            }
-                                                                            if ui.small_button("X").clicked() {
-                                                                                del_svc = Some(si);
-                                                                            }
-                                                                        });
-                                                                        ui.horizontal(|ui| {
-                                                                            ui.label("Start:");
-                                                                            if pasteable_singleline(ui, &mut svc.start_cmd, 150.0, "start script...").lost_focus() {
-                                                                                svc_dirty = true;
-                                                                            }
-                                                                            if ui.small_button("...").clicked() {
-                                                                                if let Some(p) = FileDialog::new().pick_file() {
-                                                                                    svc.start_cmd = p.to_string_lossy().to_string();
-                                                                                    svc_dirty = true;
-                                                                                }
-                                                                            }
-                                                                        });
-                                                                        ui.horizontal(|ui| {
-                                                                            ui.label("Stop: ");
-                                                                            if pasteable_singleline(ui, &mut svc.stop_cmd, 150.0, "stop script...").lost_focus() {
-                                                                                svc_dirty = true;
-                                                                            }
-                                                                            if ui.small_button("...").clicked() {
-                                                                                if let Some(p) = FileDialog::new().pick_file() {
-                                                                                    svc.stop_cmd = p.to_string_lossy().to_string();
-                                                                                    svc_dirty = true;
-                                                                                }
-                                                                            }
-                                                                        });
-                                                                    });
-                                                                ui.add_space(3.0);
-                                                            }
-                                                            if let Some(i) = del_svc {
-                                                                cfg.companion_services.remove(i);
-                                                                svc_dirty = true;
-                                                            }
-                                                            ui.horizontal(|ui| {
-                                                                if ui.small_button("+ Add Service").clicked() {
-                                                                    cfg.companion_services.push(config::CompanionService {
-                                                                        name: "New Service".to_string(),
-                                                                        start_cmd: String::new(),
-                                                                        stop_cmd: String::new(),
-                                                                        check_port: 8888,
-                                                                        url: String::new(),
-                                                                        enabled: true,
-                                                                    });
-                                                                    svc_dirty = true;
-                                                                }
-                                                                if ui.small_button("Save").clicked() {
-                                                                    svc_dirty = true;
-                                                                }
-                                                            });
-                                                            if svc_dirty {
-                                                                outcome.sync_exes = true;
-                                                                outcome.save_note = Some("Updated Companion Services.".to_string());
-                                                            }
-                                                        });
-                                                        egui::CollapsingHeader::new(
-                                                            egui::RichText::new("Quick-Action Scripts")
-                                                                .size(10.5)
-                                                                .strong()
-                                                                .color(pal.edit_hl),
-                                                        )
-                                                        .default_open(false)
-                                                        .show(ui, |ui| {
-                                                            let mut del_sc: Option<usize> = None;
-                                                            let mut sc_dirty = false;
-                                                            for (qi, sc) in cfg.quick_scripts.iter_mut().enumerate() {
-                                                                egui::Frame::new()
-                                                                    .fill(pal.item_bg)
-                                                                    .stroke(egui::Stroke::new(1.0, pal.item_border))
-                                                                    .corner_radius(egui::CornerRadius::same(6))
-                                                                    .inner_margin(egui::Margin::same(6))
-                                                                    .show(ui, |ui| {
-                                                                        ui.horizontal(|ui| {
-                                                                            if pasteable_singleline(ui, &mut sc.label, 170.0, "Button label...").lost_focus() {
-                                                                                sc_dirty = true;
-                                                                            }
-                                                                            if ui.small_button("X").clicked() {
-                                                                                del_sc = Some(qi);
-                                                                            }
-                                                                        });
-                                                                        ui.horizontal(|ui| {
-                                                                            if pasteable_singleline(ui, &mut sc.path, 165.0, "script path...").lost_focus() {
-                                                                                sc_dirty = true;
-                                                                            }
-                                                                            if ui.small_button("...").clicked() {
-                                                                                if let Some(p) = FileDialog::new().pick_file() {
-                                                                                    sc.path = p.to_string_lossy().to_string();
-                                                                                    sc_dirty = true;
-                                                                                }
-                                                                            }
-                                                                        });
-                                                                    });
-                                                                ui.add_space(3.0);
-                                                            }
-                                                            if let Some(i) = del_sc {
-                                                                cfg.quick_scripts.remove(i);
-                                                                sc_dirty = true;
-                                                            }
-                                                            ui.horizontal(|ui| {
-                                                                if ui.small_button("+ Add Script").clicked() {
-                                                                    cfg.quick_scripts.push(config::QuickScript {
-                                                                        label: "Run Script".to_string(),
-                                                                        path: String::new(),
-                                                                    });
-                                                                    sc_dirty = true;
-                                                                }
-                                                                if ui.small_button("Save").clicked() {
-                                                                    sc_dirty = true;
-                                                                }
-                                                            });
-                                                            if sc_dirty {
-                                                                outcome.save_note = Some("Updated Quick-Action Scripts.".to_string());
-                                                            }
-                                                        });
-                                                    }
-
-                                                    ui.separator();
-                                                    ui.label(
-                                                        egui::RichText::new("SAVED ENGINES LIBRARY")
-                                                            .size(10.5)
-                                                            .strong()
-                                                            .color(pal.edit_hl),
-                                                    );
-                                                    let fallback_dir = cfg.llama_dir.clone();
-                                                    let mut del_eng_idx: Option<usize> = None;
-                                                    for (eidx, eng) in cfg.saved_engines.iter_mut().enumerate() {
-                                                        egui::Frame::new()
-                                                            .fill(pal.item_bg)
-                                                            .stroke(egui::Stroke::new(1.0, pal.item_border))
-                                                            .corner_radius(egui::CornerRadius::same(6))
-                                                            .inner_margin(egui::Margin::same(6))
-                                                            .show(ui, |ui| {
-                                                                ui.horizontal(|ui| {
-                                                                    let mut rgb = eng.color_rgb.unwrap_or_else(|| default_engine_rgb(&eng.label));
-                                                                    if ui.color_edit_button_srgb(&mut rgb).on_hover_text("Pick engine badge color").changed() {
-                                                                        eng.color_rgb = Some(rgb);
-                                                                        outcome.save_note = Some(format!("Updated color for '{}'.", eng.label));
-                                                                    }
-                                                                    pasteable_singleline(ui, &mut eng.label, 145.0, "Engine name...");
-                                                                    if ui.small_button("X").clicked() {
-                                                                        del_eng_idx = Some(eidx);
-                                                                    }
-                                                                });
-                                                                ui.horizontal(|ui| {
-                                                                    let cm = if eng.engine_kind == "custom" { "custom" } else { "llama_cpp" };
-                                                                    egui::ComboBox::from_id_salt(("eng_mode", eidx))
-                                                                        .selected_text(cm)
-                                                                        .width(78.0)
-                                                                        .show_ui(ui, |ui| {
-                                                                            ui.selectable_value(&mut eng.engine_kind, "llama_cpp".to_string(), "llama_cpp");
-                                                                            ui.selectable_value(&mut eng.engine_kind, "custom".to_string(), "custom");
-                                                                        });
-                                                                    pasteable_singleline(ui, &mut eng.exe_name, 88.0, "exe...");
-                                                                    if ui.small_button(".exe").clicked() {
-                                                                        let start = if eng.dir_path.trim().is_empty() {
-                                                                            fallback_dir.as_str()
-                                                                        } else {
-                                                                            eng.dir_path.as_str()
-                                                                        };
-                                                                        let mut dlg = FileDialog::new();
-                                                                        if cfg!(windows) {
-                                                                            dlg = dlg.add_filter("Executable", &["exe"]);
-                                                                        }
-                                                                        if Path::new(start).exists() {
-                                                                            dlg = dlg.set_directory(start);
-                                                                        }
-                                                                        if let Some(p) = dlg.pick_file() {
-                                                                            if let Some(par) = p.parent() {
-                                                                                eng.dir_path = par.to_string_lossy().to_string();
-                                                                            }
-                                                                            if let Some(fname) = p.file_name() {
-                                                                                eng.exe_name = fname.to_string_lossy().to_string();
-                                                                            }
-                                                                            outcome.save_note = Some(format!("Updated engine '{}'.", eng.label));
-                                                                        }
-                                                                    }
-                                                                });
-                                                                ui.horizontal(|ui| {
-                                                                    pasteable_singleline(ui, &mut eng.dir_path, 178.0, "Folder...");
-                                                                    if ui.small_button("...").clicked() {
-                                                                        let start = if eng.dir_path.trim().is_empty() {
-                                                                            fallback_dir.as_str()
-                                                                        } else {
-                                                                            eng.dir_path.as_str()
-                                                                        };
-                                                                        let mut dlg = FileDialog::new();
-                                                                        if Path::new(start).exists() {
-                                                                            dlg = dlg.set_directory(start);
-                                                                        }
-                                                                        if let Some(p) = dlg.pick_folder() {
-                                                                            eng.dir_path = p.to_string_lossy().to_string();
-                                                                            outcome.save_note = Some(format!("Updated folder for '{}'.", eng.label));
-                                                                        }
-                                                                    }
-                                                                });
-                                                                if eng.engine_kind == "custom" {
-                                                                    ui.horizontal(|ui| {
-                                                                        ui.label(egui::RichText::new("Args:").size(10.0).color(pal.muted));
-                                                                        if pasteable_singleline(
-                                                                            ui,
-                                                                            &mut eng.default_args,
-                                                                            165.0,
-                                                                            "serve --model {model} --ctx {ctx} --addr {addr}",
-                                                                        )
-                                                                        .lost_focus()
-                                                                        {
-                                                                            outcome.save_note = Some(format!("Updated default args for '{}'.", eng.label));
-                                                                        }
-                                                                    });
-                                                                }
-                                                            });
-                                                        ui.add_space(3.0);
-                                                    }
-                                                    if let Some(di) = del_eng_idx {
-                                                        let removed = cfg.saved_engines.remove(di);
-                                                        outcome.save_note = Some(format!("Removed saved engine '{}'.", removed.label));
-                                                    }
-
-                                                    ui.add_space(4.0);
-                                                    ui.label(egui::RichText::new("Add New Engine:").size(10.5).strong());
-                                                    ui.horizontal(|ui| {
-                                                        ui.color_edit_button_srgb(&mut drafts.new_engine_color)
-                                                            .on_hover_text("Pick color for this engine");
-                                                        pasteable_singleline(ui, &mut drafts.new_engine_label, 182.0, "Engine name...");
-                                                    });
-                                                    ui.horizontal(|ui| {
-                                                        let cm = if drafts.new_engine_kind == "custom" { "custom" } else { "llama_cpp" };
-                                                        egui::ComboBox::from_id_salt("new_eng_kind")
-                                                            .selected_text(cm)
-                                                            .width(78.0)
-                                                            .show_ui(ui, |ui| {
-                                                                ui.selectable_value(&mut drafts.new_engine_kind, "llama_cpp".to_string(), "llama_cpp");
-                                                                if ui
-                                                                    .selectable_value(&mut drafts.new_engine_kind, "custom".to_string(), "custom")
-                                                                    .clicked()
-                                                                    && drafts.new_engine_args.trim().is_empty()
-                                                                {
-                                                                    drafts.new_engine_args = "serve --model {model} --ctx {ctx} --addr {addr}".to_string();
-                                                                }
-                                                            });
-                                                        pasteable_singleline(ui, &mut drafts.new_engine_exe, 88.0, "exe...");
-                                                        if ui.small_button(".exe").clicked() {
-                                                            let mut dlg = FileDialog::new();
-                                                            if cfg!(windows) {
-                                                                dlg = dlg.add_filter("Executable", &["exe"]);
-                                                            }
-                                                            if let Some(p) = dlg.pick_file() {
-                                                                if let Some(par) = p.parent() {
-                                                                    drafts.new_engine_dir = par.to_string_lossy().to_string();
-                                                                }
-                                                                if let Some(fname) = p.file_name() {
-                                                                    drafts.new_engine_exe = fname.to_string_lossy().to_string();
-                                                                }
-                                                                if drafts.new_engine_label.trim().is_empty() {
-                                                                    if let Some(stem) = p.file_stem() {
-                                                                        drafts.new_engine_label = stem.to_string_lossy().to_string();
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-                                                    });
-                                                    if drafts.new_engine_kind == "custom" {
-                                                        ui.horizontal(|ui| {
-                                                            ui.label(egui::RichText::new("Args:").size(10.0).color(pal.muted));
-                                                            pasteable_singleline(
-                                                                ui,
-                                                                &mut drafts.new_engine_args,
-                                                                175.0,
-                                                                "serve --model {model} --ctx {ctx} --addr {addr}",
-                                                            );
-                                                        });
-                                                    }
-                                                    ui.horizontal(|ui| {
-                                                        pasteable_singleline(ui, &mut drafts.new_engine_dir, 140.0, "Folder...");
-                                                        if ui.small_button("...").clicked() {
-                                                            if let Some(p) = FileDialog::new().pick_folder() {
-                                                                drafts.new_engine_dir = p.to_string_lossy().to_string();
-                                                            }
-                                                        }
-                                                        if ui.small_button("+ Save").clicked()
-                                                            && !drafts.new_engine_label.trim().is_empty()
-                                                            && !drafts.new_engine_dir.trim().is_empty()
-                                                        {
-                                                            let lbl = drafts.new_engine_label.trim().to_string();
-                                                            let exe_n = if drafts.new_engine_exe.trim().is_empty() {
-                                                                platform::default_exe_name("llama-server")
-                                                            } else {
-                                                                drafts.new_engine_exe.trim().to_string()
-                                                            };
-                                                            let def_args = if drafts.new_engine_kind == "custom" {
-                                                                drafts.new_engine_args.trim().to_string()
-                                                            } else {
-                                                                String::new()
-                                                            };
-                                                            cfg.saved_engines.push(EnginePreset {
-                                                                label: lbl.clone(),
-                                                                engine_kind: drafts.new_engine_kind.clone(),
-                                                                dir_path: drafts.new_engine_dir.trim().to_string(),
-                                                                exe_name: exe_n,
-                                                                color_rgb: Some(drafts.new_engine_color),
-                                                                default_args: def_args,
-                                                            });
-                                                            let next_idx = cfg.saved_engines.len() % ENGINE_COLOR_PALETTE.len();
-                                                            drafts.new_engine_color = ENGINE_COLOR_PALETTE[next_idx];
-                                                            drafts.new_engine_label.clear();
-                                                            drafts.new_engine_dir.clear();
-                                                            drafts.new_engine_args.clear();
-                                                            drafts.new_engine_exe = platform::default_exe_name("llama-server");
-                                                            outcome.save_note = Some(format!("Saved engine '{lbl}'."));
-                                                        }
-                                                    });
-
-                                                    ui.separator();
-                                                    ui.label("Models Folder (.gguf):");
-                                                    ui.horizontal(|ui| {
-                                                        pasteable_singleline(ui, &mut cfg.models_dir, 185.0, "");
-                                                        if ui.button("...").clicked() {
-                                                            if let Some(p) = FileDialog::new().pick_folder() {
-                                                                cfg.models_dir = p.to_string_lossy().to_string();
-                                                                *scanned_models = scan_gguf_models(&cfg.models_dir);
-                                                                gguf_cache.clear();
-                                                                outcome.save_note = Some("Updated Models folder.".to_string());
-                                                            }
-                                                        }
-                                                    });
-                                                    ui.separator();
-                                                    ui.label(
-                                                        egui::RichText::new("FRONTEND (CHAT UI)")
-                                                            .size(10.5)
-                                                            .strong()
-                                                            .color(pal.edit_hl),
-                                                    );
-                                                    let mut fe_dirty = false;
-                                                    ui.horizontal(|ui| {
-                                                        ui.label("Name:");
-                                                        if pasteable_singleline(ui, &mut cfg.frontend_name, 145.0, "e.g. Open WebUI, SillyTavern").lost_focus() {
-                                                            fe_dirty = true;
-                                                        }
-                                                    });
-                                                    ui.label("Frontend Executable:");
-                                                    ui.horizontal(|ui| {
-                                                        if pasteable_singleline(ui, &mut cfg.frontend_exe, 185.0, "open-webui / script...").lost_focus() {
-                                                            fe_dirty = true;
-                                                        }
-                                                        if ui.button("...").clicked() {
-                                                            if let Some(p) = FileDialog::new().pick_file() {
-                                                                cfg.frontend_exe = p.to_string_lossy().to_string();
-                                                                fe_dirty = true;
-                                                            }
-                                                        }
-                                                    });
-                                                    ui.label("Frontend Folder (optional):");
-                                                    ui.horizontal(|ui| {
-                                                        if pasteable_singleline(ui, &mut cfg.owu_scripts_dir, 185.0, "Fallback dir (e.g. Scripts/)").lost_focus() {
-                                                            fe_dirty = true;
-                                                        }
-                                                        if ui.button("...").clicked() {
-                                                            if let Some(p) = FileDialog::new().pick_folder() {
-                                                                cfg.owu_scripts_dir = p.to_string_lossy().to_string();
-                                                                fe_dirty = true;
-                                                            }
-                                                        }
-                                                    });
-                                                    ui.horizontal(|ui| {
-                                                        ui.label("Args:");
-                                                        if pasteable_singleline(ui, &mut cfg.frontend_args, 175.0, "serve --port {port}").lost_focus() {
-                                                            fe_dirty = true;
-                                                        }
-                                                    });
-                                                    ui.horizontal(|ui| {
-                                                        ui.label("URL: ");
-                                                        if pasteable_singleline(ui, &mut cfg.frontend_url, 175.0, "http://127.0.0.1:{port}").lost_focus() {
-                                                            fe_dirty = true;
-                                                        }
-                                                    });
-                                                    if fe_dirty {
-                                                        outcome.sync_exes = true;
-                                                        outcome.save_note = Some("Updated Frontend settings.".to_string());
-                                                    }
-                                                    ui.horizontal_wrapped(|ui| {
-                                                        ui.label("API:");
-                                                        ui.add(egui::DragValue::new(&mut cfg.server_port).range(1024..=65535));
-                                                        ui.label("Frontend:");
-                                                        ui.add(egui::DragValue::new(&mut cfg.owu_port).range(1024..=65535));
-                                                        if cfg!(feature = "plus") {
-                                                            ui.checkbox(&mut cfg.enable_mcpo_toggle, "mcpo");
-                                                        }
-                                                    });
-                                                    if ui.checkbox(&mut cfg.use_external_cmd_windows, "Use External CMD").changed() {
-                                                        outcome.save_note = Some("Saved console mode preference.".to_string());
-                                                    }
-                                                });
-                                            });
-                                        ui.add_space(10.0);
+                                        render_setup_card(
+                                            ui,
+                                            pal,
+                                            cfg,
+                                            drafts,
+                                            scanned_models,
+                                            gguf_cache,
+                                            &mut outcome,
+                                        );
                                     }
 
                                     let hdr_col = if edit_mode { pal.edit_hl } else { pal.muted };
+                                    ui.horizontal(|ui| {
+                                        pasteable_singleline(
+                                            ui,
+                                            &mut drafts.search_query,
+                                            (col1_w - 72.0).max(90.0),
+                                            "Search families/profiles...",
+                                        );
+                                        if !drafts.search_query.is_empty()
+                                            && ui
+                                                .small_button("X")
+                                                .on_hover_text("Clear search filter")
+                                                .clicked()
+                                        {
+                                            drafts.search_query.clear();
+                                        }
+                                    });
+                                    ui.add_space(4.0);
                                     ui.add(
                                         egui::Label::new(
                                             egui::RichText::new("1. MODEL FAMILIES")
@@ -916,9 +689,11 @@ pub(crate) fn render_left_workspace(
                                             {
                                                 let title = drafts.new_group_name.trim().to_string();
                                                 let uid = cfg.make_unique_profile_id(&title);
-                                                let mut default_prof = ModelProfile::default();
-                                                default_prof.id = uid;
-                                                default_prof.help_key = guess_help_key(&title, "");
+                                                let default_prof = ModelProfile {
+                                                    id: uid,
+                                                    help_key: guess_help_key(&title, ""),
+                                                    ..ModelProfile::default()
+                                                };
                                                 cfg.groups.push(ModelGroup {
                                                     model_title: title.clone(),
                                                     subtitle: "Custom GGUF Family".to_string(),
@@ -937,12 +712,22 @@ pub(crate) fn render_left_workspace(
                                     let mut swap_groups: Option<(usize, usize)> = None;
                                     let mut del_group_idx: Option<usize> = None;
                                     let glen = cfg.groups.len();
+                                    let filter_q = drafts.search_query.trim().to_string();
+                                    let mut matched_families = 0usize;
 
                                     for idx in 0..glen {
                                         let is_sel = cfg.selected_group_idx == idx;
                                         let title = cfg.groups[idx].model_title.clone();
                                         let sub = cfg.groups[idx].subtitle.clone();
                                         let count = cfg.groups[idx].profiles.len();
+                                        if !filter_q.is_empty()
+                                            && !cfg.groups[idx].profiles.iter().any(|p| {
+                                                profile_matches_search(&title, &sub, p, &filter_q)
+                                            })
+                                        {
+                                            continue;
+                                        }
+                                        matched_families += 1;
 
                                         let (cfill, cborder) = if is_sel {
                                             (pal.item_sel_bg, pal.item_sel_border)
@@ -987,14 +772,12 @@ pub(crate) fn render_left_workspace(
                                                         egui::Sense::click(),
                                                     )
                                                     .clicked()
-                                                {
-                                                    if cfg.selected_group_idx != idx {
+                                                    && cfg.selected_group_idx != idx {
                                                         cfg.selected_group_idx = idx;
                                                         cfg.selected_profile_idx = 0;
                                                         let _ = cfg.save();
                                                         *saved_cfg = cfg.clone();
                                                     }
-                                                }
 
                                                 if edit_mode {
                                                     ui.add_space(4.0);
@@ -1046,6 +829,13 @@ pub(crate) fn render_left_workspace(
                                         ui.add_space(4.0);
                                     }
 
+                                    if !filter_q.is_empty() && matched_families == 0 {
+                                        ui.label(
+                                            egui::RichText::new("No matching families or profiles.")
+                                                .size(11.0)
+                                                .color(pal.muted),
+                                        );
+                                    }
                                     if let Some((a, b)) = swap_groups {
                                         cfg.groups.swap(a, b);
                                         if cfg.selected_group_idx == a {
@@ -1056,8 +846,8 @@ pub(crate) fn render_left_workspace(
                                         outcome.save_note =
                                             Some("Reordered Model Families and saved.".to_string());
                                     }
-                                    if let Some(di) = del_group_idx {
-                                        if cfg.groups.len() > 1 {
+                                    if let Some(di) = del_group_idx
+                                        && cfg.groups.len() > 1 {
                                             let removed = cfg.groups.remove(di);
                                             let removed_ids: Vec<String> = removed
                                                 .profiles
@@ -1076,7 +866,6 @@ pub(crate) fn render_left_workspace(
                                                 removed.model_title
                                             ));
                                         }
-                                    }
                                 });
                         });
                     },
@@ -1106,15 +895,54 @@ pub(crate) fn render_left_workspace(
                             let hdr_col = if edit_mode { pal.edit_hl } else { pal.muted };
                             let sub_col = if edit_mode { pal.edit_hl } else { pal.accent };
 
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new("2. SUB-PROFILES")
-                                        .size(12.0)
-                                        .strong()
-                                        .color(hdr_col),
-                                )
-                                .selectable(false),
-                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("2. SUB-PROFILES")
+                                            .size(12.0)
+                                            .strong()
+                                            .color(hdr_col),
+                                    )
+                                    .selectable(false),
+                                );
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    if ui
+                                        .small_button("Import")
+                                        .on_hover_text("Import a portable profile (.toml) into this Model Family")
+                                        .clicked()
+                                        && let Some(path) = file_dialog_in("")
+                                            .add_filter("Profile TOML", &["toml", "TOML"])
+                                            .pick_file()
+                                    {
+                                        match std::fs::read_to_string(&path) {
+                                            Ok(raw) => match ModelProfile::from_portable_toml(&raw, scanned_models) {
+                                                Ok(mut imported) => {
+                                                    let seed = if imported.name.trim().is_empty() {
+                                                        "imported-profile".to_string()
+                                                    } else {
+                                                        format!("{g_title}-{}", imported.name)
+                                                    };
+                                                    imported.id = cfg.make_unique_profile_id(&seed);
+                                                    let imported_name = imported.name.clone();
+                                                    if let Some(grp) = cfg.groups.get_mut(g_idx) {
+                                                        grp.profiles.push(imported);
+                                                        cfg.selected_profile_idx = grp.profiles.len() - 1;
+                                                        outcome.save_note = Some(format!(
+                                                            "Imported profile '{imported_name}' into '{g_title}'."
+                                                        ));
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    *status_msg = format!("Profile import failed: {e}");
+                                                }
+                                            },
+                                            Err(e) => {
+                                                *status_msg = format!("Failed reading file: {e}");
+                                            }
+                                        }
+                                    }
+                                });
+                            });
                             ui.add(
                                 egui::Label::new(
                                     egui::RichText::new(&g_title)
@@ -1178,8 +1006,18 @@ pub(crate) fn render_left_workspace(
                                 .show(ui, |ui| {
                                     if let Some(grp) = cfg.groups.get(g_idx) {
                                         let plen = grp.profiles.len();
-                                        for pidx in 0..plen {
-                                            let p = &grp.profiles[pidx];
+                                        let filter_q = drafts.search_query.trim();
+                                        for (pidx, p) in grp.profiles.iter().enumerate() {
+                                            if !filter_q.is_empty()
+                                                && !profile_matches_search(
+                                                    &grp.model_title,
+                                                    &grp.subtitle,
+                                                    p,
+                                                    filter_q,
+                                                )
+                                            {
+                                                continue;
+                                            }
                                             let is_sel = cfg.selected_profile_idx == pidx;
                                             let pid = p.id.clone();
                                             let pname = p.name.clone();
@@ -1345,8 +1183,8 @@ pub(crate) fn render_left_workspace(
                                     }
                                 });
 
-                            if let Some(pid) = toggle_link_pid {
-                                if let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
+                            if let Some(pid) = toggle_link_pid
+                                && let Some(set) = cfg.routing_sets.get_mut(cfg.selected_set_idx) {
                                     if let Some(pos) = set.profile_ids.iter().position(|x| x == &pid)
                                     {
                                         set.profile_ids.remove(pos);
@@ -1361,9 +1199,8 @@ pub(crate) fn render_left_workspace(
                                         );
                                     }
                                 }
-                            }
-                            if let Some((a, b)) = swap_profs {
-                                if let Some(grp) = cfg.groups.get_mut(g_idx) {
+                            if let Some((a, b)) = swap_profs
+                                && let Some(grp) = cfg.groups.get_mut(g_idx) {
                                     grp.profiles.swap(a, b);
                                     if cfg.selected_profile_idx == a {
                                         cfg.selected_profile_idx = b;
@@ -1373,9 +1210,8 @@ pub(crate) fn render_left_workspace(
                                     outcome.save_note =
                                         Some("Reordered sub-profiles and saved.".to_string());
                                 }
-                            }
-                            if let Some(di) = dup_prof {
-                                if let Some(orig) = cfg
+                            if let Some(di) = dup_prof
+                                && let Some(orig) = cfg
                                     .groups
                                     .get(g_idx)
                                     .and_then(|g| g.profiles.get(di))
@@ -1393,18 +1229,16 @@ pub(crate) fn render_left_workspace(
                                             Some("Duplicated sub-profile.".to_string());
                                     }
                                 }
-                            }
                             if let Some(di) = del_prof {
                                 let mut removed_info: Option<(String, String)> = None;
-                                if let Some(grp) = cfg.groups.get_mut(g_idx) {
-                                    if grp.profiles.len() > 1 {
+                                if let Some(grp) = cfg.groups.get_mut(g_idx)
+                                    && grp.profiles.len() > 1 {
                                         let removed = grp.profiles.remove(di);
                                         removed_info = Some((removed.id, removed.name));
                                         if cfg.selected_profile_idx >= grp.profiles.len() {
                                             cfg.selected_profile_idx = grp.profiles.len() - 1;
                                         }
                                     }
-                                }
                                 if let Some((rid, rname)) = removed_info {
                                     for s in &mut cfg.routing_sets {
                                         s.profile_ids.retain(|x| x != &rid);

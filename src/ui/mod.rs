@@ -1,8 +1,11 @@
 mod console;
 mod drawer;
+mod header;
 mod inspector;
+mod setup;
 mod sidebar;
-mod theme;
+pub(crate) mod theme;
+mod tray;
 
 use crate::config::{
     parse_help_markdown, parse_help_markdown_str, scan_gguf_models, GgufInfo, HelpMap, StackConfig,
@@ -13,25 +16,24 @@ use console::{console_notifier, llama_vp_id, owu_vp_id, render_console_viewport}
 use drawer::{render_right_drawer, CodePreviewScope, RightDrawerTab};
 use eframe::egui;
 use inspector::{render_advanced_inspector, render_spec_inspector};
-use rfd::FileDialog;
+
 use runtime::{
-    active_backend_info, init_running_state, launch_mcpo, launch_open_webui, launch_routing_set,
-    launch_single_profile, poll_tracked_processes, run_bat_file, start_companion_service,
-    stop_companion_service, stop_tracked_backend, stop_tracked_frontend, stop_tracked_mcpo,
+    active_backend_info, init_running_state, launch_routing_set,
+    launch_single_profile, poll_tracked_processes, stop_tracked_backend,
     sync_live_llama_swap_yaml, ConsoleBuffer, ProcStatus, SharedConsole, SharedErrors,
 };
 use sidebar::{render_left_workspace, SidebarDrafts};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use theme::{
-    apply_app_theme, contrast_on, engine_badge_color_for, palette_for, pasteable_singleline,
-    themed_card,
+    apply_app_theme, contrast_on, engine_badge_color_for, file_dialog_in, palette_for,
+    pasteable_singleline, themed_card,
 };
+use tray::{TrayAction, TrayController};
 
 fn load_window_icon(icon_path: &str, embedded: Option<&[u8]>) -> Option<egui::IconData> {
     let bytes = fs::read(icon_path.trim())
@@ -58,6 +60,8 @@ struct ControlCenterApp {
     loaded_label: Option<String>,
     shared_status: Arc<Mutex<ProcStatus>>,
     shared_comp_ports: Arc<Mutex<Vec<u16>>>,
+    shared_telemetry: Arc<Mutex<crate::runtime::TelemetrySnapshot>>,
+    shared_api_target: Arc<Mutex<(String, u16)>>,
     llama_console: SharedConsole,
     owu_console: SharedConsole,
     show_llama_console: Arc<AtomicBool>,
@@ -74,6 +78,8 @@ struct ControlCenterApp {
     edit_mode: bool,
     applied_theme_sig: (ThemeMode, [u8; 3], bool),
     status_msg: String,
+    tray: TrayController,
+    allow_close: bool,
 }
 
 impl ControlCenterApp {
@@ -90,11 +96,17 @@ impl ControlCenterApp {
     }
 
     fn new(ctx: egui::Context, patch: AppPatch) -> Self {
-        let cfg = StackConfig::load_with_hooks(
+        let mut cfg = StackConfig::load_with_hooks(
             patch.default_config_fn,
             patch.legacy_migrator_fn,
             patch.post_load_fn,
         );
+        if cfg.secondary_node.host.trim().is_empty()
+            && let Some(ep) = patch.default_rpc_endpoint.as_deref()
+                && let Some((host, port)) = crate::config::SecondaryNodeConfig::parse_host_port(ep) {
+                    cfg.secondary_node.host = host;
+                    cfg.secondary_node.rpc_port = port;
+                }
         let saved_cfg = cfg.clone();
         let scanned_models = scan_gguf_models(&cfg.models_dir);
         let help_map = Self::load_help_with_fallback(&cfg.help_md_path, patch.embedded_help_md);
@@ -114,11 +126,16 @@ impl ControlCenterApp {
          None
      };
 
+     let init_telemetry = crate::runtime::poll_telemetry(&cfg.server_host, cfg.server_port, initial.llama);
      let shared_status = Arc::new(Mutex::new(initial));
      let shared_comp_ports = Arc::new(Mutex::new(init_comp_ports));
-     let (bg_status, bg_ports, bg_ctx) = (
+     let shared_telemetry = Arc::new(Mutex::new(init_telemetry));
+     let shared_api_target = Arc::new(Mutex::new((cfg.server_host.clone(), cfg.server_port)));
+     let (bg_status, bg_ports, bg_tele, bg_api, bg_ctx) = (
          Arc::clone(&shared_status),
          Arc::clone(&shared_comp_ports),
+         Arc::clone(&shared_telemetry),
+         Arc::clone(&shared_api_target),
          ctx.clone(),
      );
 
@@ -129,6 +146,14 @@ impl ControlCenterApp {
          if let Ok(mut guard) = bg_status.lock() {
              *guard = latest;
          }
+         let (api_host, api_port) = bg_api
+             .lock()
+             .map(|g| g.clone())
+             .unwrap_or_else(|_| ("127.0.0.1".to_string(), 8080));
+         let snap = crate::runtime::poll_telemetry(&api_host, api_port, latest.llama);
+         if let Ok(mut guard) = bg_tele.lock() {
+             *guard = snap;
+         }
          bg_ctx.request_repaint_of(egui::ViewportId::ROOT);
      });
 
@@ -137,6 +162,12 @@ impl ControlCenterApp {
          "{} Ready — pick a Routing Set on top, or browse Model Families -> Sub-Profiles below.",
          patch.effective_version()
      );
+     let tray_tip = format!(
+         "{} {}",
+         effective_app_title(&cfg, &patch),
+         patch.effective_version()
+     );
+     let tray = TrayController::start(ctx.clone(), tray_tip);
      Self {
          patch,
          cfg,
@@ -148,6 +179,8 @@ impl ControlCenterApp {
          loaded_label,
          shared_status,
          shared_comp_ports,
+         shared_telemetry,
+         shared_api_target,
          llama_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
          owu_console: Arc::new(Mutex::new(ConsoleBuffer::default())),
          show_llama_console: Arc::new(AtomicBool::new(false)),
@@ -163,6 +196,8 @@ impl ControlCenterApp {
          edit_mode: false,
          applied_theme_sig: sig,
          status_msg: ready_msg,
+         tray,
+         allow_close: false,
      }
  }
 
@@ -174,6 +209,9 @@ impl ControlCenterApp {
              .iter()
              .map(|s| s.check_port)
              .collect();
+     }
+     if let Ok(mut g) = self.shared_api_target.lock() {
+         *g = (self.cfg.server_host.clone(), self.cfg.server_port);
      }
  }
 
@@ -225,6 +263,13 @@ impl ControlCenterApp {
             *g = s;
         }
     }
+
+    pub(super) fn current_telemetry(&self) -> crate::runtime::TelemetrySnapshot {
+        self.shared_telemetry
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl eframe::App for ControlCenterApp {
@@ -270,6 +315,62 @@ impl eframe::App for ControlCenterApp {
             self.loaded_label = None;
         }
 
+        // SYSTEM TRAY ACTIONS & CLOSE-TO-TRAY INTERCEPT
+        for action in self.tray.poll_actions() {
+            match action {
+                TrayAction::Show => {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayAction::OpenBrowser => {
+                    platform::open_url(&self.cfg.effective_frontend_url());
+                }
+                TrayAction::SoftUnload => {
+                    match runtime::soft_unload_llama_swap(&self.cfg.server_host, self.cfg.server_port) {
+                        Ok(()) => {
+                            if let Ok(mut g) = self.shared_telemetry.lock() {
+                                g.running_models.clear();
+                            }
+                            self.status_msg = "Sent Soft Unload via tray — VRAM freeing.".to_string();
+                        }
+                        Err(e) => self.push_error(format!("Tray Soft Unload failed: {e}")),
+                    }
+                }
+                TrayAction::StopAll => {
+                    stop_tracked_backend();
+                    runtime::stop_tracked_frontend();
+                    runtime::stop_tracked_mcpo();
+                    if cfg!(feature = "plus") {
+                        for (ci, svc) in self.cfg.companion_services.iter().enumerate() {
+                            if svc.enabled
+                                && ci < procs.companion_running.len()
+                                && procs.companion_running[ci]
+                            {
+                                let _ = runtime::stop_companion_service(svc);
+                            }
+                        }
+                    }
+                    self.loaded_label = None;
+                    procs = ProcStatus::default();
+                    self.set_procs(procs);
+                    self.status_msg = "Stopped all services via tray.".to_string();
+                }
+                TrayAction::Quit => {
+                    self.allow_close = true;
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if self.cfg.minimize_to_tray
+            && !self.allow_close
+            && self.tray.is_active()
+            && ui.ctx().input(|i| i.viewport().close_requested())
+        {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         let err_count = self.error_logs.lock().map(|l| l.len()).unwrap_or(0);
         let edit_mode = self.edit_mode;
 
@@ -295,584 +396,7 @@ impl eframe::App for ControlCenterApp {
         // MAIN CENTRAL PANEL
         egui::CentralPanel::default().show(ui, |ui| {
             // TOP HEADER CARD
-            themed_card(pal).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let title_str = if edit_mode {
-                        format!(
-                            "{} {}  [EDIT MODE]",
-                            effective_app_title(&self.cfg, &self.patch).to_uppercase(),
-                            self.patch.effective_version()
-                        )
-                    } else {
-                        format!(
-                            "{} {}",
-                            effective_app_title(&self.cfg, &self.patch).to_uppercase(),
-                            self.patch.effective_version()
-                        )
-                    };
-                    let title_col = if edit_mode { pal.edit_hl } else { pal.text };
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(title_str)
-                                .size(17.5)
-                                .strong()
-                                .color(title_col),
-                        )
-                        .selectable(false),
-                    );
-                    ui.add_space(8.0);
-                    let st_col = if edit_mode { pal.edit_hl } else { pal.accent };
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&self.status_msg)
-                                .size(12.0)
-                                .color(st_col),
-                        )
-                        .selectable(false),
-                    );
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let err_lbl = format!("Error Log ({err_count})");
-                        let err_fill = if err_count > 0 {
-                            egui::Color32::from_rgb(165, 32, 38)
-                        } else {
-                            pal.btn_idle
-                        };
-                        let err_txt = if err_count > 0 {
-                            egui::Color32::WHITE
-                        } else {
-                            pal.btn_idle_text
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(err_lbl).strong().color(err_txt),
-                                )
-                                .fill(err_fill),
-                            )
-                            .clicked()
-                        {
-                            self.show_error_log = !self.show_error_log;
-                        }
-
-                        let code_open = self.right_drawer == Some(RightDrawerTab::CodeYaml);
-                        let code_btn = egui::Button::new(
-                            egui::RichText::new("Code / YAML").strong().color(if code_open {
-                                pal.accent_text
-                            } else {
-                                pal.btn_idle_text
-                            }),
-                        )
-                        .fill(if code_open { pal.accent } else { pal.btn_idle });
-                        if ui.add(code_btn).clicked() {
-                            self.right_drawer = if code_open {
-                                None
-                            } else {
-                                Some(RightDrawerTab::CodeYaml)
-                            };
-                        }
-
-                        if cfg!(feature = "plus") {
-                            let help_open = self.right_drawer == Some(RightDrawerTab::Help);
-                            let help_btn = egui::Button::new(
-                                egui::RichText::new("Help").strong().color(if help_open {
-                                    pal.accent_text
-                                } else {
-                                    pal.btn_idle_text
-                                }),
-                            )
-                            .fill(if help_open { pal.accent } else { pal.btn_idle });
-                            if ui.add(help_btn).clicked() {
-                                self.right_drawer = if help_open {
-                                    None
-                                } else {
-                                    Some(RightDrawerTab::Help)
-                                };
-                            }
-                        }
-
-                        let th_btn = egui::Button::new(
-                            egui::RichText::new("Theme").strong().color(if self.show_theme_bar {
-                                pal.accent_text
-                            } else {
-                                pal.btn_idle_text
-                            }),
-                        )
-                        .fill(if self.show_theme_bar {
-                            pal.accent
-                        } else {
-                            pal.btn_idle
-                        });
-                        if ui.add(th_btn).clicked() {
-                            self.show_theme_bar = !self.show_theme_bar;
-                        }
-
-                        let hint_lbl = if self.show_plain_hints {
-                            "Hints: ON"
-                        } else {
-                            "Hints: OFF"
-                        };
-                        let hint_fill = if self.show_plain_hints {
-                            egui::Color32::from_rgb(16, 125, 78)
-                        } else {
-                            pal.btn_idle
-                        };
-                        let hint_txt = if self.show_plain_hints {
-                            egui::Color32::WHITE
-                        } else {
-                            pal.btn_idle_text
-                        };
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(hint_lbl).strong().color(hint_txt),
-                                )
-                                .fill(hint_fill),
-                            )
-                            .clicked()
-                        {
-                            self.show_plain_hints = !self.show_plain_hints;
-                        }
-
-                        let (em_lbl, em_fill, em_txt) = if edit_mode {
-                            ("EDIT MODE: ON", pal.edit_hl, contrast_on(pal.edit_hl))
-                        } else {
-                            ("Edit Mode: OFF", pal.btn_idle, pal.btn_idle_text)
-                        };
-                        let em_btn = egui::Button::new(
-                            egui::RichText::new(em_lbl).strong().color(em_txt),
-                        )
-                        .fill(em_fill)
-                        .corner_radius(egui::CornerRadius::same(14));
-                        if ui.add(em_btn).clicked() {
-                            self.edit_mode = !self.edit_mode;
-                            self.status_msg = if self.edit_mode {
-                                "Edit Mode UNLOCKED — edit Routing Sets, Families, Sub-Profiles, Engines, and paths.".to_string()
-                            } else {
-                                "Edit Mode LOCKED — back to clean Daily Mode.".to_string()
-                            };
-                        }
-                    });
-                });
-
-                // COLLAPSIBLE THEME BAR
-                if self.show_theme_bar {
-                    ui.add_space(6.0);
-                    ui.separator();
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("Surface:").size(12.0).color(pal.muted));
-                        let mut theme_changed = false;
-                        theme_changed |= ui
-                            .selectable_value(
-                                &mut self.cfg.theme_mode,
-                                ThemeMode::OledBlack,
-                                "OLED Black (#000)",
-                            )
-                            .changed();
-                        theme_changed |= ui
-                            .selectable_value(
-                                &mut self.cfg.theme_mode,
-                                ThemeMode::Grey,
-                                "Grey (Mid)",
-                            )
-                            .changed();
-                        theme_changed |= ui
-                            .selectable_value(
-                                &mut self.cfg.theme_mode,
-                                ThemeMode::Light,
-                                "Warm Matte Light",
-                            )
-                            .changed();
-
-                        ui.separator();
-                        ui.label(egui::RichText::new("Accent:").size(12.0).color(pal.muted));
-                        let presets: &[(&str, [u8; 3])] = &[
-                            ("Blue", [59, 130, 246]),
-                            ("Emerald", [16, 185, 129]),
-                            ("Cyan", [6, 182, 212]),
-                            ("Yellow", [250, 204, 21]),
-                            ("Amber", [245, 158, 11]),
-                            ("Rose", [244, 63, 94]),
-                            ("Violet", [139, 92, 246]),
-                        ];
-                        for (name, rgb) in presets {
-                            let c = egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-                            let selected = self.cfg.accent_rgb == *rgb;
-                            let sw = egui::Button::new("")
-                                .fill(c)
-                                .min_size(egui::vec2(20.0, 20.0))
-                                .stroke(if selected {
-                                    egui::Stroke::new(2.0, pal.text)
-                                } else {
-                                    egui::Stroke::new(1.0, pal.card_border)
-                                });
-                            if ui.add(sw).on_hover_text(*name).clicked() {
-                                self.cfg.accent_rgb = *rgb;
-                                theme_changed = true;
-                            }
-                        }
-
-                        let mut custom = egui::Color32::from_rgb(
-                            self.cfg.accent_rgb[0],
-                            self.cfg.accent_rgb[1],
-                            self.cfg.accent_rgb[2],
-                        );
-                        if ui.color_edit_button_srgba(&mut custom).changed() {
-                            self.cfg.accent_rgb = [custom.r(), custom.g(), custom.b()];
-                            theme_changed = true;
-                        }
-
-                        if theme_changed {
-                            self.save_now("Saved theme & accent preference.");
-                        }
-                    });
-                }
-
-                ui.add_space(6.0);
-                // SERVICE & CONSOLE ROW
-                ui.horizontal_wrapped(|ui| {
-                    let llama_lbl = if procs.llama {
-                        format!("Engine (:{}): ON", self.cfg.server_port)
-                    } else {
-                        format!("Engine (:{}): OFF", self.cfg.server_port)
-                    };
-                    let llama_fill = if procs.llama {
-                        egui::Color32::from_rgb(16, 125, 78)
-                    } else {
-                        pal.btn_idle
-                    };
-                    let llama_txt = if procs.llama {
-                        egui::Color32::WHITE
-                    } else {
-                        pal.btn_idle_text
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(llama_lbl).strong().color(llama_txt),
-                            )
-                            .fill(llama_fill)
-                            .corner_radius(egui::CornerRadius::same(14)),
-                        )
-                        .clicked()
-                    {
-                        if procs.llama {
-                            stop_tracked_backend();
-                            self.loaded_label = None;
-                            procs.llama = false;
-                            self.set_procs(procs);
-                            self.status_msg =
-                                "Stopped active inference engine — VRAM freed.".to_string();
-                        } else if let Some(set) =
-                            self.cfg.routing_sets.get(self.cfg.selected_set_idx).cloned()
-                        {
-                            self.sync_backend_exes();
-                            match launch_routing_set(
-                                &self.cfg,
-                                &set,
-                                Arc::clone(&self.llama_console),
-                                Arc::clone(&self.error_logs),
-                                console_notifier(ui.ctx().clone(), llama_vp_id()),
-                            ) {
-                                Ok(()) => {
-                                    self.loaded_label =
-                                        Some(format!("Routing Set: {} [{}]", set.name, set.mode));
-                                    procs.llama = true;
-                                    self.set_procs(procs);
-                                    self.status_msg = format!(
-                                        "Started Routing Set '{}' on :{}.",
-                                        set.name, self.cfg.server_port
-                                    );
-                                }
-                                Err(e) => self.push_error(e),
-                            }
-                        }
-                    }
-
-                    let fe_name = self.cfg.effective_frontend_name().to_string();
-                    let owu_lbl = if procs.owu {
-                        format!("{fe_name} (:{}): ON", self.cfg.owu_port)
-                    } else {
-                        format!("{fe_name} (:{}): OFF", self.cfg.owu_port)
-                    };
-                    let owu_fill = if procs.owu {
-                        egui::Color32::from_rgb(16, 125, 78)
-                    } else {
-                        pal.btn_idle
-                    };
-                    let owu_txt = if procs.owu {
-                        egui::Color32::WHITE
-                    } else {
-                        pal.btn_idle_text
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(egui::RichText::new(owu_lbl).strong().color(owu_txt))
-                                .fill(owu_fill)
-                                .corner_radius(egui::CornerRadius::same(14)),
-                        )
-                        .clicked()
-                    {
-                        if procs.owu {
-                            stop_tracked_frontend();
-                            procs.owu = false;
-                            self.set_procs(procs);
-                            self.status_msg = format!("Stopped {fe_name}.");
-                        } else {
-                            match launch_open_webui(
-                                &self.cfg,
-                                Arc::clone(&self.owu_console),
-                                Arc::clone(&self.error_logs),
-                                console_notifier(ui.ctx().clone(), owu_vp_id()),
-                            ) {
-                                Ok(()) => {
-                                    procs.owu = true;
-                                    self.set_procs(procs);
-                                    self.status_msg =
-                                        format!("Started {fe_name} on port {}.", self.cfg.owu_port);
-                                }
-                                Err(e) => self.push_error(e),
-                            }
-                        }
-                    }
-
-                    if cfg!(feature = "plus") {
-                        let comp_snap = self.cfg.companion_services.clone();
-                        for (ci, svc) in comp_snap.iter().enumerate() {
-                            if !svc.enabled || svc.name.trim().is_empty() {
-                                continue;
-                            }
-                            let is_on =
-                                ci < procs.companion_running.len() && procs.companion_running[ci];
-                            let port_tag = if svc.check_port > 0 {
-                                format!(" (:{})", svc.check_port)
-                            } else {
-                                String::new()
-                            };
-                            let lbl = if is_on {
-                                format!("{}{port_tag}: ON", svc.name)
-                            } else {
-                                format!("{}{port_tag}: OFF", svc.name)
-                            };
-                            let fill = if is_on {
-                                egui::Color32::from_rgb(16, 125, 78)
-                            } else {
-                                pal.btn_idle
-                            };
-                            let txt = if is_on {
-                                egui::Color32::WHITE
-                            } else {
-                                pal.btn_idle_text
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(egui::RichText::new(lbl).strong().color(txt))
-                                        .fill(fill)
-                                        .corner_radius(egui::CornerRadius::same(14)),
-                                )
-                                .clicked()
-                            {
-                                let res = if is_on {
-                                    stop_companion_service(svc)
-                                } else {
-                                    start_companion_service(svc)
-                                };
-                                match res {
-                                    Ok(()) => {
-                                        if ci < procs.companion_running.len() {
-                                            procs.companion_running[ci] = !is_on;
-                                        }
-                                        self.set_procs(procs);
-                                        self.status_msg = format!(
-                                            "{} {}...",
-                                            if is_on { "Stopping" } else { "Starting" },
-                                            svc.name
-                                        );
-                                    }
-                                    Err(e) => self.push_error(e),
-                                }
-                            }
-                        }
-                        if self.cfg.enable_mcpo_toggle {
-                            let mcpo_lbl = if procs.mcpo {
-                                format!("mcpo (:{}): ON", self.cfg.mcpo_port)
-                            } else {
-                                format!("mcpo (:{}): OFF", self.cfg.mcpo_port)
-                            };
-                            let mcpo_fill = if procs.mcpo {
-                                egui::Color32::from_rgb(16, 125, 78)
-                            } else {
-                                pal.btn_idle
-                            };
-                            let mcpo_txt = if procs.mcpo {
-                                egui::Color32::WHITE
-                            } else {
-                                pal.btn_idle_text
-                            };
-                            if ui
-                                .add(
-                                    egui::Button::new(
-                                        egui::RichText::new(mcpo_lbl).strong().color(mcpo_txt),
-                                    )
-                                    .fill(mcpo_fill)
-                                    .corner_radius(egui::CornerRadius::same(14)),
-                                )
-                                .clicked()
-                            {
-                                if procs.mcpo {
-                                    stop_tracked_mcpo();
-                                    procs.mcpo = false;
-                                    self.set_procs(procs);
-                                } else if let Err(e) = launch_mcpo(&self.cfg) {
-                                    self.push_error(e);
-                                } else {
-                                    procs.mcpo = true;
-                                    self.set_procs(procs);
-                                }
-                            }
-                        }
-                    }
-
-                    ui.separator();
-                    let llama_win_open = self.show_llama_console.load(Ordering::Relaxed);
-                    let owu_win_open = self.show_owu_console.load(Ordering::Relaxed);
-                    let any_console_open = llama_win_open || owu_win_open;
-                    let fe_con_tag = if fe_name == "Open WebUI" {
-                        "OWU"
-                    } else {
-                        "Frontend"
-                    };
-
-                    let l_fill = if llama_win_open {
-                        pal.accent
-                    } else {
-                        pal.btn_idle
-                    };
-                    let l_txt = if llama_win_open {
-                        pal.accent_text
-                    } else {
-                        pal.btn_idle_text
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(if llama_win_open {
-                                    "Engine Console [ON]"
-                                } else {
-                                    "Engine Console"
-                                })
-                                .strong()
-                                .color(l_txt),
-                            )
-                            .fill(l_fill),
-                        )
-                        .clicked()
-                    {
-                        self.show_llama_console
-                            .store(!llama_win_open, Ordering::Relaxed);
-                    }
-                    let o_fill = if owu_win_open {
-                        egui::Color32::from_rgb(16, 125, 78)
-                    } else {
-                        pal.btn_idle
-                    };
-                    let o_txt = if owu_win_open {
-                        egui::Color32::WHITE
-                    } else {
-                        pal.btn_idle_text
-                    };
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(if owu_win_open {
-                                    format!("{fe_con_tag} Console [ON]")
-                                } else {
-                                    format!("{fe_con_tag} Console")
-                                })
-                                .strong()
-                                .color(o_txt),
-                            )
-                            .fill(o_fill),
-                        )
-                        .clicked()
-                    {
-                        self.show_owu_console.store(!owu_win_open, Ordering::Relaxed);
-                    }
-                    if ui
-                        .button(if any_console_open {
-                            "Close Both Consoles"
-                        } else {
-                            "Open Both Consoles"
-                        })
-                        .clicked()
-                    {
-                        let next = !any_console_open;
-                        self.show_llama_console.store(next, Ordering::Relaxed);
-                        self.show_owu_console.store(next, Ordering::Relaxed);
-                    }
-
-                    ui.separator();
-                    if ui.button("Open Browser").clicked() {
-                        platform::open_url(&self.cfg.effective_frontend_url());
-                    }
-                    if cfg!(feature = "plus") {
-                        if !self.cfg.update_owu_bat.trim().is_empty()
-                            && ui.button("Update OWU").clicked()
-                        {
-                            if let Err(e) = run_bat_file(&self.cfg.update_owu_bat) {
-                                self.push_error(e);
-                            } else {
-                                self.status_msg = "Launched Update OWU script.".to_string();
-                            }
-                        }
-                        if !self.cfg.update_python_bat.trim().is_empty()
-                            && ui.button("Update Python").clicked()
-                        {
-                            if let Err(e) = run_bat_file(&self.cfg.update_python_bat) {
-                                self.push_error(e);
-                            } else {
-                                self.status_msg = "Launched Update Python script.".to_string();
-                            }
-                        }
-                        for sc in self.cfg.quick_scripts.clone() {
-                            if sc.label.trim().is_empty() || sc.path.trim().is_empty() {
-                                continue;
-                            }
-                            if ui.button(&sc.label).clicked() {
-                                if let Err(e) = run_bat_file(&sc.path) {
-                                    self.push_error(e);
-                                } else {
-                                    self.status_msg = format!("Launched {}.", sc.label);
-                                }
-                            }
-                        }
-                    }
-                    let stop_all = egui::Button::new(
-                        egui::RichText::new("Stop All")
-                            .strong()
-                            .color(egui::Color32::WHITE),
-                    )
-                    .fill(egui::Color32::from_rgb(145, 32, 38));
-                    if ui.add(stop_all).clicked() {
-                        stop_tracked_backend();
-                        stop_tracked_frontend();
-                        stop_tracked_mcpo();
-                        if cfg!(feature = "plus") {
-                            for (ci, svc) in self.cfg.companion_services.iter().enumerate() {
-                                if svc.enabled
-                                    && ci < procs.companion_running.len()
-                                    && procs.companion_running[ci]
-                                {
-                                    let _ = stop_companion_service(svc);
-                                }
-                            }
-                        }
-                        self.loaded_label = None;
-                        self.set_procs(ProcStatus::default());
-                        self.status_msg = "All services stopped. VRAM cleared.".to_string();
-                    }
-                });
-            });
+            procs = self.render_top_header(ui, pal, procs, err_count, edit_mode);
 
             ui.add_space(8.0);
             let log_reserve = if self.show_error_log { 155.0 } else { 0.0 };
@@ -1118,6 +642,36 @@ impl eframe::App for ControlCenterApp {
                                         {
                                             revert_requested = true;
                                         }
+                                        if ui
+                                            .add(egui::Button::new("Export").min_size(egui::vec2(64.0, 32.0)))
+                                            .on_hover_text("Export this sub-profile as a path-stripped portable .toml file")
+                                            .clicked()
+                                            && let Some(prof) = self
+                                                .cfg
+                                                .groups
+                                                .get(g_idx)
+                                                .and_then(|g| g.profiles.get(p_idx))
+                                        {
+                                            let default_name = format!("{}.toml", crate::config::slugify(&prof.name));
+                                            if let Some(save_path) = file_dialog_in("")
+                                                .set_file_name(&default_name)
+                                                .add_filter("Profile TOML", &["toml"])
+                                                .save_file()
+                                            {
+                                                match prof.to_portable_toml() {
+                                                    Ok(toml_body) => match fs::write(&save_path, toml_body) {
+                                                        Ok(()) => {
+                                                            self.status_msg = format!(
+                                                                "Exported portable profile to {}",
+                                                                save_path.display()
+                                                            );
+                                                        }
+                                                        Err(e) => self.push_error(format!("Export write failed: {e}")),
+                                                    },
+                                                    Err(e) => self.push_error(format!("Export serialize failed: {e}")),
+                                                }
+                                            }
+                                        }
                                         if has_unsaved {
                                             ui.label(
                                                 egui::RichText::new("Unsaved / Temp")
@@ -1171,6 +725,9 @@ impl eframe::App for ControlCenterApp {
                                                             ui.label("Idle TTL (s):");
                                                             ui.add(egui::DragValue::new(&mut prof.ttl_seconds).range(0..=7200).speed(30))
                                                                 .on_hover_text("Auto-unload seconds in llama-swap (0 = never unload).");
+                                                            ui.label("Health:");
+                                                            pasteable_singleline(ui, &mut prof.check_endpoint, 95.0, "/health or none")
+                                                                .on_hover_text("Optional llama-swap checkEndpoint (leave blank for /health, or set 'none' / '/v1/models').");
                                                         });
                                                         ui.horizontal_wrapped(|ui| {
                                                             egui::ComboBox::from_id_salt("bind_saved_engine")
@@ -1234,12 +791,9 @@ impl eframe::App for ControlCenterApp {
                                                                 } else {
                                                                     prof.engine_dir_override.as_str()
                                                                 };
-                                                                let mut dlg = FileDialog::new();
+                                                                let mut dlg = file_dialog_in(start_dir);
                                                                 if cfg!(windows) {
                                                                     dlg = dlg.add_filter("Executable", &["exe"]);
-                                                                }
-                                                                if Path::new(start_dir).exists() {
-                                                                    dlg = dlg.set_directory(start_dir);
                                                                 }
                                                                 if let Some(p) = dlg.pick_file() {
                                                                     if let Some(par) = p.parent() {
@@ -1248,11 +802,10 @@ impl eframe::App for ControlCenterApp {
                                                                     if let Some(fname) = p.file_name() {
                                                                         prof.engine_exe_override = fname.to_string_lossy().to_string();
                                                                     }
-                                                                    if prof.engine_label.trim().is_empty() {
-                                                                        if let Some(stem) = p.file_stem() {
+                                                                    if prof.engine_label.trim().is_empty()
+                                                                        && let Some(stem) = p.file_stem() {
                                                                             prof.engine_label = stem.to_string_lossy().to_string();
                                                                         }
-                                                                    }
                                                                     trigger_save_msg = Some("Bound custom engine executable to sub-profile.".to_string());
                                                                 }
                                                             }
@@ -1320,6 +873,22 @@ impl eframe::App for ControlCenterApp {
                                         }
 
                                         if let Some(prof) = grp.profiles.get_mut(p_idx) {
+                                            let sec_rpc_ep = self
+                                                .cfg
+                                                .secondary_node
+                                                .rpc_endpoint()
+                                                .or_else(|| {
+                                                    let legacy = prof.single.rpc_endpoint.trim();
+                                                    if !self.cfg.secondary_node.enabled
+                                                        && self.cfg.secondary_node.host.trim().is_empty()
+                                                        && !legacy.is_empty()
+                                                    {
+                                                        Some(legacy.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                });
+
                                             ui.horizontal(|ui| {
                                                 let simple_sel = !prof.use_manual_flags;
                                                 let adv_sel = prof.use_manual_flags;
@@ -1339,6 +908,11 @@ impl eframe::App for ControlCenterApp {
                                                     pal.btn_idle
                                                 });
                                                 if ui.add(s_btn).clicked() {
+                                                    if prof.use_manual_flags
+                                                        && !prof.manual_flags.trim().is_empty()
+                                                    {
+                                                        prof.sync_simple_from_manual_flags(&models_dir);
+                                                    }
                                                     prof.use_manual_flags = false;
                                                 }
 
@@ -1357,16 +931,23 @@ impl eframe::App for ControlCenterApp {
                                                     pal.btn_idle
                                                 });
                                                 if ui.add(a_btn).clicked() {
-                                                    if prof.manual_flags.trim().is_empty() {
+                                                    if !prof.use_manual_flags {
+                                                        let eff_rpc = if prof.single.use_rpc {
+                                                            sec_rpc_ep
+                                                                .as_deref()
+                                                                .or_else(|| prof.single.legacy_rpc_opt())
+                                                        } else {
+                                                            None
+                                                        };
                                                         prof.manual_flags =
-                                                            prof.generate_manual_template();
+                                                            prof.generate_manual_template_with_rpc(eff_rpc);
                                                     }
                                                     prof.use_manual_flags = true;
                                                 }
 
                                                 if prof.use_manual_flags {
                                                     ui.label(
-                                                        egui::RichText::new("Using manual flags")
+                                                        egui::RichText::new("Two-way synced with Simple Mode")
                                                             .size(11.0)
                                                             .color(pal.muted),
                                                     );
@@ -1383,6 +964,7 @@ impl eframe::App for ControlCenterApp {
                                                     is_light,
                                                     pal,
                                                     &models_dir,
+                                                    sec_rpc_ep.as_deref(),
                                                     &mut self.scanned_models,
                                                     &mut self.gguf_cache,
                                                     &mut trigger_save_msg,
@@ -1405,6 +987,17 @@ impl eframe::App for ControlCenterApp {
                                                     .selectable(false),
                                                 );
 
+                                                let prev_single = prof.single.clone();
+                                                let prev_port = prof.port;
+                                                let prev_host = prof.host.clone();
+
+                                                let rpc_fallback = self.cfg.secondary_node.rpc_fallback;
+                                                let local_vram_mib = self
+                                                    .shared_telemetry
+                                                    .lock()
+                                                    .ok()
+                                                    .and_then(|t| t.gpu_vram.as_ref().map(|g| g.total_mib))
+                                                    .filter(|&m| m > 0);
                                                 let mut port_copy = prof.port;
                                                 render_spec_inspector(
                                                     ui,
@@ -1417,10 +1010,28 @@ impl eframe::App for ControlCenterApp {
                                                     &mut self.scanned_models,
                                                     &mut self.gguf_cache,
                                                     &mut port_copy,
+                                                    sec_rpc_ep.as_deref(),
+                                                    rpc_fallback,
+                                                    local_vram_mib,
                                                     "cc_single_slot",
                                                     &mut trigger_save_msg,
                                                 );
                                                 prof.port = port_copy;
+
+                                                if prof.single != prev_single
+                                                    || prof.port != prev_port
+                                                    || prof.host != prev_host
+                                                {
+                                                    let eff_rpc = if prof.single.use_rpc {
+                                                        sec_rpc_ep
+                                                            .as_deref()
+                                                            .or_else(|| prof.single.legacy_rpc_opt())
+                                                    } else {
+                                                        None
+                                                    };
+                                                    prof.manual_flags =
+                                                        prof.generate_manual_template_with_rpc(eff_rpc);
+                                                }
                                             }
                                         }
                                     }
@@ -1472,11 +1083,10 @@ impl eframe::App for ControlCenterApp {
                             if ui.button("Close").clicked() {
                                 self.show_error_log = false;
                             }
-                            if ui.button("Clear Log").clicked() {
-                                if let Ok(mut l) = self.error_logs.lock() {
+                            if ui.button("Clear Log").clicked()
+                                && let Ok(mut l) = self.error_logs.lock() {
                                     l.clear();
                                 }
-                            }
                             if ui.button("Notepad").clicked() {
                                 runtime::open_text_in_notepad("error_log.txt", &full_log);
                             }

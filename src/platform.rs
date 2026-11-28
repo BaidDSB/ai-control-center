@@ -64,7 +64,7 @@ pub fn resolve_config_dir(config_filename: &str) -> PathBuf {
     let dir = exe_dir();
     let probe = dir.join(".cc_write_probe.tmp");
     if dir.join(config_filename).exists() {
-        if fs::OpenOptions::new().write(true).append(true).open(dir.join(config_filename)).is_ok() {
+        if fs::OpenOptions::new().append(true).open(dir.join(config_filename)).is_ok() {
             return dir;
         }
     } else if fs::write(&probe, b"").is_ok() {
@@ -465,14 +465,14 @@ pub fn exe_name_matches(actual: &str, expected: &str) -> bool {
     }
     let a_stem = a.strip_suffix(".exe").unwrap_or(&a);
     let e_stem = e.strip_suffix(".exe").unwrap_or(&e);
-    if a_stem == e_stem {
-        return true;
+    #[cfg(windows)]
+    {
+        a_stem == e_stem
     }
     #[cfg(not(windows))]
-    if a.len() == 15 && e.starts_with(&a) {
-        return true;
+    {
+        a_stem == e_stem || (a.len() == 15 && e.starts_with(&a))
     }
-    false
 }
 
 #[cfg(windows)]

@@ -1,8 +1,11 @@
-use super::theme::{pasteable_singleline, pill_switch, plain_help_row, UiPalette};
-use crate::config::{probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec};
+use super::theme::{file_dialog_in, pasteable_singleline, pill_switch, plain_help_row, UiPalette};
+use crate::config::{
+    estimate_profile_vram, probe_gguf_header, scan_gguf_models, GgufInfo, ModelProfile, ModelSpec,
+    RpcFallbackPolicy,
+};
 use crate::runtime;
 use eframe::egui;
-use rfd::FileDialog;
+
 use std::collections::HashMap;
 
 fn hint_tag_colors(is_light: bool) -> (egui::Color32, egui::Color32, egui::Color32, egui::Color32) {
@@ -35,6 +38,9 @@ pub(crate) fn render_spec_inspector(
     scanned_models: &mut Vec<String>,
     gguf_cache: &mut HashMap<String, GgufInfo>,
     port_val: &mut u16,
+    secondary_rpc_ep: Option<&str>,
+    rpc_fallback: RpcFallbackPolicy,
+    local_vram_mib: Option<u64>,
     id_salt: &str,
     trigger_save_msg: &mut Option<String>,
 ) {
@@ -59,10 +65,9 @@ pub(crate) fn render_spec_inspector(
                 *scanned_models = scan_gguf_models(models_dir);
                 gguf_cache.clear();
             }
-            if ui.button("Pick...").clicked() {
-                if let Some(p) = FileDialog::new()
-                    .set_directory(models_dir)
-                    .add_filter("GGUF", &["gguf"])
+            if ui.button("Pick...").clicked()
+                && let Some(p) = file_dialog_in(models_dir)
+                    .add_filter("GGUF", &["gguf", "GGUF"])
                     .pick_file()
                 {
                     spec.model_rel_path = p
@@ -72,7 +77,6 @@ pub(crate) fn render_spec_inspector(
                     gguf_cache.remove(&format!("{models_dir}::{}", spec.model_rel_path));
                     *trigger_save_msg = Some(format!("Linked GGUF '{}'.", spec.model_rel_path));
                 }
-            }
         });
 
         ui.horizontal_wrapped(|ui| {
@@ -110,6 +114,51 @@ pub(crate) fn render_spec_inspector(
             )
             .selectable(false),
         );
+
+        if let Some(est) = estimate_profile_vram(&ginfo, spec) {
+            let approx = if est.is_approximate { "~" } else { "" };
+            let ram_part = if est.total_ram_offload_gb >= 0.05 {
+                format!(" | Est. RAM offload: {:.1} GB", est.total_ram_offload_gb)
+            } else {
+                String::new()
+            };
+            let (fit_tag, fit_col) = if let Some(vram_mib) = local_vram_mib.filter(|&m| m > 0) {
+                let cap_gb = vram_mib as f64 / 1024.0;
+                let ratio = est.total_vram_gb / cap_gb;
+                if ratio > 0.98 {
+                    if spec.use_rpc {
+                        (format!(" [>{cap_gb:.1} GB local — using RPC pool]"), c_vram)
+                    } else {
+                        (
+                            format!(" [Exceeds {:.1} GB local VRAM]", cap_gb),
+                            if is_light {
+                                egui::Color32::from_rgb(185, 28, 28)
+                            } else {
+                                egui::Color32::from_rgb(248, 113, 113)
+                            },
+                        )
+                    }
+                } else if ratio > 0.85 {
+                    (format!(" [Tight on {:.1} GB GPU]", cap_gb), c_qual)
+                } else {
+                    (format!(" [Fits {:.1} GB GPU]", cap_gb), c_speed)
+                }
+            } else {
+                (String::new(), pal.muted)
+            };
+
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "Pre-Launch Est. VRAM: {approx}{:.1} GB (Weights {:.1} + KV {:.1} + Buf {:.1}){ram_part}{fit_tag}",
+                        est.total_vram_gb, est.weights_vram_gb, est.kv_cache_gb, est.overhead_gb
+                    ))
+                    .size(11.0)
+                    .color(fit_col),
+                )
+                .selectable(false),
+            );
+        }
     }
 
     ui.add_space(4.0);
@@ -220,10 +269,28 @@ pub(crate) fn render_spec_inspector(
                     "RPC: OFF",
                     edit_mode,
                     pal,
-                    "Pools remote GPU VRAM over LAN (--rpc). Keep on its own sub-profile so daily sets work when the remote node is off.",
+                    "Pools remote GPU VRAM from the centralized Secondary Node configured in Setup. Auto policy falls back locally in 120ms if the node is off.",
                 );
                 if spec.use_rpc {
-                    pasteable_singleline(ui, &mut spec.rpc_endpoint, 165.0, "192.168.x.x:50052");
+                    let pol_tag = match rpc_fallback {
+                        RpcFallbackPolicy::Auto => "Auto",
+                        RpcFallbackPolicy::Strict => "Strict",
+                    };
+                    if let Some(ep) = secondary_rpc_ep {
+                        ui.label(
+                            egui::RichText::new(format!("-> {ep} ({pol_tag})"))
+                                .size(11.5)
+                                .color(c_vram),
+                        )
+                        .on_hover_text("Managed centrally in Edit Mode -> Setup -> Secondary Node (LAN / RPC).");
+                    } else {
+                        ui.label(
+                            egui::RichText::new("No Secondary Node enabled (set in Setup)")
+                                .size(11.0)
+                                .color(c_qual),
+                        )
+                        .on_hover_text("Enable Edit Mode -> Setup -> Secondary Node (LAN / RPC) to set Host/IP and RPC Port.");
+                    }
                 }
             });
             plain_help_row(
@@ -427,8 +494,8 @@ pub(crate) fn render_spec_inspector(
                 ui.label("Extra / Custom Flags:")
                     .on_hover_text("For llama_cpp: appended at the end. For custom engines (e.g. RustingStrata): used verbatim with {model}, {ctx}, {host}, {port}, {addr}.");
                 pasteable_singleline(ui, &mut spec.extra_args, 310.0, "Extra CLI flags or full custom engine command...");
-                if ui.button("Paste").clicked() {
-                    if let Some(clip) = runtime::read_from_clipboard() {
+                if ui.button("Paste").clicked()
+                    && let Some(clip) = runtime::read_from_clipboard() {
                         let cleaned = clip.replace(['\r', '\n'], " ");
                         let trimmed = cleaned.trim();
                         if !trimmed.is_empty() {
@@ -438,7 +505,6 @@ pub(crate) fn render_spec_inspector(
                             spec.extra_args.push_str(trimmed);
                         }
                     }
-                }
                 if !spec.extra_args.is_empty() && ui.button("Clear").clicked() {
                     spec.extra_args.clear();
                 }
@@ -510,11 +576,19 @@ pub(crate) fn render_advanced_inspector(
     is_light: bool,
     pal: UiPalette,
     models_dir: &str,
+    sec_rpc_ep: Option<&str>,
     scanned_models: &mut Vec<String>,
     gguf_cache: &mut HashMap<String, GgufInfo>,
     trigger_save_msg: &mut Option<String>,
 ) {
     let (c_vram, _c_speed, c_qual, _c_ram) = hint_tag_colors(is_light);
+    let prev_top = (
+        prof.single.model_rel_path.clone(),
+        prof.single.use_alias,
+        prof.single.alias.clone(),
+        prof.single.ctx_size,
+        prof.port,
+    );
 
     if edit_mode {
         ui.horizontal_wrapped(|ui| {
@@ -535,10 +609,9 @@ pub(crate) fn render_advanced_inspector(
                 *scanned_models = scan_gguf_models(models_dir);
                 gguf_cache.clear();
             }
-            if ui.button("Pick...").clicked() {
-                if let Some(p) = FileDialog::new()
-                    .set_directory(models_dir)
-                    .add_filter("GGUF", &["gguf"])
+            if ui.button("Pick...").clicked()
+                && let Some(p) = file_dialog_in(models_dir)
+                    .add_filter("GGUF", &["gguf", "GGUF"])
                     .pick_file()
                 {
                     prof.single.model_rel_path = p
@@ -548,7 +621,6 @@ pub(crate) fn render_advanced_inspector(
                     gguf_cache.remove(&format!("{models_dir}::{}", prof.single.model_rel_path));
                     *trigger_save_msg = Some(format!("Linked GGUF '{}'.", prof.single.model_rel_path));
                 }
-            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.checkbox(&mut prof.single.use_alias, "OWU Alias:");
@@ -565,6 +637,33 @@ pub(crate) fn render_advanced_inspector(
             ui.label("Ctx ({ctx}):");
             ui.add(egui::DragValue::new(&mut prof.single.ctx_size).range(2048..=1_048_576).speed(1024));
         });
+    }
+
+    let top_changed = prof.single.model_rel_path != prev_top.0
+        || prof.single.use_alias != prev_top.1
+        || prof.single.alias != prev_top.2
+        || prof.single.ctx_size != prev_top.3
+        || prof.port != prev_top.4;
+    if top_changed && prof.effective_engine_kind() != "custom" {
+        let new_model = prof.single.model_rel_path.clone();
+        let new_use_alias = prof.single.use_alias;
+        let new_alias = prof.single.alias.clone();
+        let new_ctx = prof.single.ctx_size;
+        let new_port = prof.port;
+        if !prof.manual_flags.trim().is_empty() {
+            prof.sync_simple_from_manual_flags(models_dir);
+        }
+        prof.single.model_rel_path = new_model;
+        prof.single.use_alias = new_use_alias;
+        prof.single.alias = new_alias;
+        prof.single.ctx_size = new_ctx;
+        prof.port = new_port;
+        let eff_rpc = if prof.single.use_rpc {
+            sec_rpc_ep.or_else(|| prof.single.legacy_rpc_opt())
+        } else {
+            None
+        };
+        prof.manual_flags = prof.generate_manual_template_with_rpc(eff_rpc);
     }
 
     let cache_key = format!("{models_dir}::{}", prof.single.model_rel_path);
@@ -595,25 +694,32 @@ pub(crate) fn render_advanced_inspector(
         ui.label(egui::RichText::new("Manual CLI Flags (Raw Override):").strong().color(pal.text));
         if ui
             .button("Pull From Simple")
-            .on_hover_text("Overwrite box with flags generated from Simple Mode controls.")
+            .on_hover_text("Re-format box with flags generated from Simple Mode controls and Extra Args.")
             .clicked()
         {
-            prof.manual_flags = prof.generate_manual_template();
+            let eff_rpc = if prof.single.use_rpc {
+                sec_rpc_ep.or_else(|| prof.single.legacy_rpc_opt())
+            } else {
+                None
+            };
+            prof.manual_flags = prof.generate_manual_template_with_rpc(eff_rpc);
         }
-        if ui.button("Paste").on_hover_text("Paste flags from clipboard.").clicked() {
-            if let Some(clip) = runtime::read_from_clipboard() {
-                let cleaned = clip.replace(['\r', '\n'], " ");
-                let trimmed = cleaned.trim();
-                if !trimmed.is_empty() {
-                    if !prof.manual_flags.trim().is_empty() && !prof.manual_flags.ends_with(' ') {
-                        prof.manual_flags.push(' ');
-                    }
-                    prof.manual_flags.push_str(trimmed);
+        if ui.button("Paste").on_hover_text("Paste flags from clipboard and sync into Simple Mode.").clicked()
+            && let Some(clip) = runtime::read_from_clipboard()
+        {
+            let cleaned = clip.replace(['\r', '\n'], " ");
+            let trimmed = cleaned.trim();
+            if !trimmed.is_empty() {
+                if !prof.manual_flags.trim().is_empty() && !prof.manual_flags.ends_with(' ') {
+                    prof.manual_flags.push(' ');
                 }
+                prof.manual_flags.push_str(trimmed);
+                prof.sync_simple_from_manual_flags(models_dir);
             }
         }
         if !prof.manual_flags.is_empty() && ui.button("Clear").clicked() {
             prof.manual_flags.clear();
+            prof.single.extra_args.clear();
         }
         pill_switch(
             ui,
@@ -644,17 +750,36 @@ pub(crate) fn render_advanced_inspector(
         .corner_radius(egui::CornerRadius::same(8))
         .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {
-            ui.add(
+            let te_resp = ui.add(
                 egui::TextEdit::multiline(&mut prof.manual_flags)
                     .font(egui::TextStyle::Monospace)
                     .hint_text("Type any CLI flags here... e.g. -m {model} -c {ctx} -ngl 99 -fa on --host {host} --port {port}")
                     .desired_width(f32::INFINITY)
                     .desired_rows(9),
             );
+            if te_resp.changed() || te_resp.lost_focus() {
+                if prof.manual_flags.trim().is_empty() {
+                    prof.single.extra_args.clear();
+                } else {
+                    prof.sync_simple_from_manual_flags(models_dir);
+                }
+            }
         });
 
     ui.add_space(8.0);
-    egui::CollapsingHeader::new("Temperature, Samplers & DRY (Auto-appended if not typed above)")
+    let prev_samp = (
+        prof.single.use_custom_sampling,
+        prof.single.temp.to_bits(),
+        prof.single.min_p.to_bits(),
+        prof.single.top_p.to_bits(),
+        prof.single.top_k,
+        prof.single.presence_penalty.to_bits(),
+        prof.single.repeat_penalty.to_bits(),
+        prof.single.dry_multiplier.to_bits(),
+        prof.single.dry_base.to_bits(),
+        prof.single.dry_allowed_length,
+    );
+    egui::CollapsingHeader::new("Temperature, Samplers & DRY (Synced with flags above)")
         .default_open(true)
         .show(ui, |ui| {
             plain_help_row(
@@ -700,4 +825,48 @@ pub(crate) fn render_advanced_inspector(
                 });
             }
         });
+
+    let cur_samp = (
+        prof.single.use_custom_sampling,
+        prof.single.temp.to_bits(),
+        prof.single.min_p.to_bits(),
+        prof.single.top_p.to_bits(),
+        prof.single.top_k,
+        prof.single.presence_penalty.to_bits(),
+        prof.single.repeat_penalty.to_bits(),
+        prof.single.dry_multiplier.to_bits(),
+        prof.single.dry_base.to_bits(),
+        prof.single.dry_allowed_length,
+    );
+    if cur_samp != prev_samp && prof.effective_engine_kind() != "custom" {
+        let saved_use = prof.single.use_custom_sampling;
+        let saved_temp = prof.single.temp;
+        let saved_min_p = prof.single.min_p;
+        let saved_top_p = prof.single.top_p;
+        let saved_top_k = prof.single.top_k;
+        let saved_pres = prof.single.presence_penalty;
+        let saved_rep = prof.single.repeat_penalty;
+        let saved_dry_m = prof.single.dry_multiplier;
+        let saved_dry_b = prof.single.dry_base;
+        let saved_dry_l = prof.single.dry_allowed_length;
+        if !prof.manual_flags.trim().is_empty() {
+            prof.sync_simple_from_manual_flags(models_dir);
+        }
+        prof.single.use_custom_sampling = saved_use;
+        prof.single.temp = saved_temp;
+        prof.single.min_p = saved_min_p;
+        prof.single.top_p = saved_top_p;
+        prof.single.top_k = saved_top_k;
+        prof.single.presence_penalty = saved_pres;
+        prof.single.repeat_penalty = saved_rep;
+        prof.single.dry_multiplier = saved_dry_m;
+        prof.single.dry_base = saved_dry_b;
+        prof.single.dry_allowed_length = saved_dry_l;
+        let eff_rpc = if prof.single.use_rpc {
+            sec_rpc_ep.or_else(|| prof.single.legacy_rpc_opt())
+        } else {
+            None
+        };
+        prof.manual_flags = prof.generate_manual_template_with_rpc(eff_rpc);
+    }
 }
