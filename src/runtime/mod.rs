@@ -64,7 +64,7 @@ mod tests {
         assert_eq!(normalize_probe_host("0.0.0.0"), "127.0.0.1");
         assert_eq!(normalize_probe_host("::"), "127.0.0.1");
         assert_eq!(normalize_probe_host(""), "127.0.0.1");
-        assert_eq!(normalize_probe_host(" 192.168.1.50 "), "192.168.1.50");
+        assert_eq!(normalize_probe_host(" 10.0.0.50 "), "10.0.0.50");
     }
 
     #[test]
@@ -104,11 +104,11 @@ mod tests {
 
     #[test]
     fn parse_nvidia_smi_csv_reads_used_total_and_name() {
-        let sample = "2145, 8192, NVIDIA GeForce RTX 3070\n";
+        let sample = "2145, 8192, NVIDIA GeForce Example GPU\n";
         let info = parse_nvidia_smi_csv(sample).expect("parse nvidia-smi csv");
         assert_eq!(info.used_mib, 2145);
         assert_eq!(info.total_mib, 8192);
-        assert_eq!(info.name, "NVIDIA GeForce RTX 3070");
+        assert_eq!(info.name, "NVIDIA GeForce Example GPU");
         assert!((info.total_gb() - 8.0).abs() < 0.01);
         assert!(parse_nvidia_smi_csv("bad line").is_none());
     }
@@ -132,7 +132,8 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
 
         let srv = thread::spawn(move || {
-            for _ in 0..2 {
+            let mut unload_calls = 0usize;
+            for _ in 0..4 {
                 if let Ok((mut stream, _)) = listener.accept() {
                     let mut req_buf = [0u8; 512];
                     let n = stream.read(&mut req_buf).unwrap_or(0);
@@ -145,6 +146,17 @@ mod tests {
                             body
                         );
                         let _ = stream.write_all(resp.as_bytes());
+                    } else if req.starts_with("POST /api/models/unload") {
+                        unload_calls += 1;
+                        if unload_calls == 1 {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                            );
+                        } else {
+                            let _ = stream.write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\nConnection: close\r\n\r\nnot found",
+                            );
+                        }
                     } else if req.starts_with("GET /unload") {
                         let _ = stream.write_all(
                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
@@ -157,6 +169,7 @@ mod tests {
         let running = poll_llama_swap_running("127.0.0.1", port).expect("poll /running");
         assert_eq!(running.len(), 1);
         assert_eq!(running[0].model, "qwen3.6-35b");
+        assert!(soft_unload_llama_swap("127.0.0.1", port).is_ok());
         assert!(soft_unload_llama_swap("127.0.0.1", port).is_ok());
         let _ = srv.join();
     }

@@ -10,34 +10,42 @@ use crate::config::{ModelProfile, RoutingSet, RpcFallbackPolicy, StackConfig};
 fn resolve_profile_rpc_for_launch(
     cfg: &StackConfig,
     profile: &ModelProfile,
-) -> (Option<String>, Option<String>) {
+) -> Result<(Option<String>, Option<String>), String> {
     if !profile.single.use_rpc {
-        return (None, None);
+        return Ok((None, None));
     }
     let Some(ep) = cfg.effective_rpc_for_profile(&profile.single, None) else {
-        return (
+        return Ok((
             None,
             Some("[RPC] Profile has RPC ON, but Secondary Node is disabled/empty — running locally.".to_string()),
-        );
+        ));
     };
     match cfg.secondary_node.rpc_fallback {
-        RpcFallbackPolicy::Strict => (
-            Some(ep.clone()),
-            Some(format!("[RPC] Strict policy -> pooling remote GPU at {ep}")),
-        ),
+        RpcFallbackPolicy::Strict => {
+            if probe_tcp_endpoint(&ep, RPC_PROBE_TIMEOUT_MS) {
+                Ok((
+                    Some(ep.clone()),
+                    Some(format!("[RPC] Strict probe OK ({ep}) -> pooling remote GPU VRAM")),
+                ))
+            } else {
+                Err(format!(
+                    "[RPC Strict] Secondary node {ep} is offline ({RPC_PROBE_TIMEOUT_MS}ms probe) — launch blocked to prevent OOM."
+                ))
+            }
+        }
         RpcFallbackPolicy::Auto => {
             if probe_tcp_endpoint(&ep, RPC_PROBE_TIMEOUT_MS) {
-                (
+                Ok((
                     Some(ep.clone()),
                     Some(format!("[RPC] Auto probe OK ({ep}) -> pooling remote GPU VRAM")),
-                )
+                ))
             } else {
-                (
+                Ok((
                     None,
                     Some(format!(
                         "[RPC] Secondary node {ep} unreachable ({RPC_PROBE_TIMEOUT_MS}ms probe) — Auto zero-wait fallback to local GPU/RAM."
                     )),
-                )
+                ))
             }
         }
     }
@@ -46,37 +54,45 @@ fn resolve_profile_rpc_for_launch(
 fn resolve_set_rpc_for_launch(
     cfg: &StackConfig,
     linked: &[&ModelProfile],
-) -> (Option<bool>, Option<String>) {
+) -> Result<(Option<bool>, Option<String>), String> {
     let first_ep = linked
         .iter()
         .find_map(|p| cfg.effective_rpc_for_profile(&p.single, None));
     let Some(ep) = first_ep else {
         if linked.iter().any(|p| p.single.use_rpc) {
-            return (
+            return Ok((
                 Some(false),
                 Some("[RPC] RPC-enabled profile(s) in set, but Secondary Node is disabled/empty — running locally.".to_string()),
-            );
+            ));
         }
-        return (None, None);
+        return Ok((None, None));
     };
     match cfg.secondary_node.rpc_fallback {
-        RpcFallbackPolicy::Strict => (
-            Some(true),
-            Some(format!("[RPC] Strict policy -> pooling remote GPU at {ep}")),
-        ),
+        RpcFallbackPolicy::Strict => {
+            if probe_tcp_endpoint(&ep, RPC_PROBE_TIMEOUT_MS) {
+                Ok((
+                    Some(true),
+                    Some(format!("[RPC] Strict probe OK ({ep}) -> RPC enabled for marked profiles")),
+                ))
+            } else {
+                Err(format!(
+                    "[RPC Strict] Secondary node {ep} is offline ({RPC_PROBE_TIMEOUT_MS}ms probe) — Routing Set launch blocked."
+                ))
+            }
+        }
         RpcFallbackPolicy::Auto => {
             if probe_tcp_endpoint(&ep, RPC_PROBE_TIMEOUT_MS) {
-                (
+                Ok((
                     Some(true),
                     Some(format!("[RPC] Auto probe OK ({ep}) -> RPC enabled for marked profiles")),
-                )
+                ))
             } else {
-                (
+                Ok((
                     Some(false),
                     Some(format!(
                         "[RPC] Secondary node {ep} unreachable ({RPC_PROBE_TIMEOUT_MS}ms probe) — Auto zero-wait fallback to local GPU/RAM."
                     )),
-                )
+                ))
             }
         }
     }
@@ -110,7 +126,7 @@ pub fn sync_live_llama_swap_yaml(cfg: &StackConfig) -> Result<bool, String> {
         };
         linked.push(p);
     }
-    let (rpc_reachable, _) = resolve_set_rpc_for_launch(cfg, &linked);
+    let (rpc_reachable, _) = resolve_set_rpc_for_launch(cfg, &linked)?;
     for p in &linked {
         let resolved_rpc = cfg.effective_rpc_for_profile(&p.single, rpc_reachable);
         let (cmd_check, _) = p.build_swap_cmd_and_env_with_engines_and_rpc(
@@ -311,7 +327,7 @@ pub fn launch_single_profile(
         ));
     }
 
-    let (resolved_rpc, rpc_note) = resolve_profile_rpc_for_launch(cfg, profile);
+    let (resolved_rpc, rpc_note) = resolve_profile_rpc_for_launch(cfg, profile)?;
     let args = profile.build_llama_args_with_rpc(&cfg.models_dir, resolved_rpc.as_deref());
     let disable_pinned = profile.should_disable_cuda_pinned();
     let mut headers = vec![format!("[ENGINE] {engine_kind} -> {}", exe.display())];
@@ -419,7 +435,7 @@ pub fn launch_routing_set(
                 exe.display()
             ));
         }
-        let (rpc_reachable, rpc_note) = resolve_set_rpc_for_launch(cfg, &linked);
+        let (rpc_reachable, rpc_note) = resolve_set_rpc_for_launch(cfg, &linked)?;
         let ini = cfg.build_routing_set_ini_with_rpc_status(set, rpc_reachable);
         fs::write(cfg.resolved_router_ini_path(), ini)
             .map_err(|e| format!("Failed writing models.ini: {e}"))?;
@@ -479,7 +495,7 @@ pub fn launch_routing_set(
     if !swap_exe.exists() {
         return Err(format!("{swap_name} not found at {}", swap_exe.display()));
     }
-    let (rpc_reachable, rpc_note) = resolve_set_rpc_for_launch(cfg, &linked);
+    let (rpc_reachable, rpc_note) = resolve_set_rpc_for_launch(cfg, &linked)?;
     for p in &linked {
         let resolved_rpc = cfg.effective_rpc_for_profile(&p.single, rpc_reachable);
         let (cmd_check, _) = p.build_swap_cmd_and_env_with_engines_and_rpc(

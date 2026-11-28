@@ -873,6 +873,22 @@ impl eframe::App for ControlCenterApp {
                                         }
 
                                         if let Some(prof) = grp.profiles.get_mut(p_idx) {
+                                            let sec_rpc_ep = self
+                                                .cfg
+                                                .secondary_node
+                                                .rpc_endpoint()
+                                                .or_else(|| {
+                                                    let legacy = prof.single.rpc_endpoint.trim();
+                                                    if !self.cfg.secondary_node.enabled
+                                                        && self.cfg.secondary_node.host.trim().is_empty()
+                                                        && !legacy.is_empty()
+                                                    {
+                                                        Some(legacy.to_string())
+                                                    } else {
+                                                        None
+                                                    }
+                                                });
+
                                             ui.horizontal(|ui| {
                                                 let simple_sel = !prof.use_manual_flags;
                                                 let adv_sel = prof.use_manual_flags;
@@ -892,6 +908,11 @@ impl eframe::App for ControlCenterApp {
                                                     pal.btn_idle
                                                 });
                                                 if ui.add(s_btn).clicked() {
+                                                    if prof.use_manual_flags
+                                                        && !prof.manual_flags.trim().is_empty()
+                                                    {
+                                                        prof.sync_simple_from_manual_flags(&models_dir);
+                                                    }
                                                     prof.use_manual_flags = false;
                                                 }
 
@@ -910,16 +931,23 @@ impl eframe::App for ControlCenterApp {
                                                     pal.btn_idle
                                                 });
                                                 if ui.add(a_btn).clicked() {
-                                                    if prof.manual_flags.trim().is_empty() {
+                                                    if !prof.use_manual_flags {
+                                                        let eff_rpc = if prof.single.use_rpc {
+                                                            sec_rpc_ep
+                                                                .as_deref()
+                                                                .or_else(|| prof.single.legacy_rpc_opt())
+                                                        } else {
+                                                            None
+                                                        };
                                                         prof.manual_flags =
-                                                            prof.generate_manual_template();
+                                                            prof.generate_manual_template_with_rpc(eff_rpc);
                                                     }
                                                     prof.use_manual_flags = true;
                                                 }
 
                                                 if prof.use_manual_flags {
                                                     ui.label(
-                                                        egui::RichText::new("Using manual flags")
+                                                        egui::RichText::new("Two-way synced with Simple Mode")
                                                             .size(11.0)
                                                             .color(pal.muted),
                                                     );
@@ -936,6 +964,7 @@ impl eframe::App for ControlCenterApp {
                                                     is_light,
                                                     pal,
                                                     &models_dir,
+                                                    sec_rpc_ep.as_deref(),
                                                     &mut self.scanned_models,
                                                     &mut self.gguf_cache,
                                                     &mut trigger_save_msg,
@@ -958,21 +987,10 @@ impl eframe::App for ControlCenterApp {
                                                     .selectable(false),
                                                 );
 
-                                                let sec_rpc_ep = self
-                                                    .cfg
-                                                    .secondary_node
-                                                    .rpc_endpoint()
-                                                    .or_else(|| {
-                                                        let legacy = prof.single.rpc_endpoint.trim();
-                                                        if !self.cfg.secondary_node.enabled
-                                                            && self.cfg.secondary_node.host.trim().is_empty()
-                                                            && !legacy.is_empty()
-                                                        {
-                                                            Some(legacy.to_string())
-                                                        } else {
-                                                            None
-                                                        }
-                                                    });
+                                                let prev_single = prof.single.clone();
+                                                let prev_port = prof.port;
+                                                let prev_host = prof.host.clone();
+
                                                 let rpc_fallback = self.cfg.secondary_node.rpc_fallback;
                                                 let local_vram_mib = self
                                                     .shared_telemetry
@@ -999,6 +1017,21 @@ impl eframe::App for ControlCenterApp {
                                                     &mut trigger_save_msg,
                                                 );
                                                 prof.port = port_copy;
+
+                                                if prof.single != prev_single
+                                                    || prof.port != prev_port
+                                                    || prof.host != prev_host
+                                                {
+                                                    let eff_rpc = if prof.single.use_rpc {
+                                                        sec_rpc_ep
+                                                            .as_deref()
+                                                            .or_else(|| prof.single.legacy_rpc_opt())
+                                                    } else {
+                                                        None
+                                                    };
+                                                    prof.manual_flags =
+                                                        prof.generate_manual_template_with_rpc(eff_rpc);
+                                                }
                                             }
                                         }
                                     }

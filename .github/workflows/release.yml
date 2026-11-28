@@ -55,7 +55,7 @@ jobs:
       - name: Package Core
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.1.0}"
+          VERSION="${GITHUB_REF_NAME:-v1.2.0}"
           mkdir -p stage-core artifacts
           if [ "${{ runner.os }}" = "Linux" ]; then
             cp "target/release/ai-control-center" "stage-core/ai-control-center-core-${VERSION}"
@@ -72,7 +72,7 @@ jobs:
       - name: Package Plus
         shell: bash
         run: |
-          VERSION="${GITHUB_REF_NAME:-v1.1.0}"
+          VERSION="${GITHUB_REF_NAME:-v1.2.0}"
           mkdir -p stage-plus artifacts
           cp help.example.md stage-plus/help.example.md
           if [ "${{ runner.os }}" = "Linux" ]; then

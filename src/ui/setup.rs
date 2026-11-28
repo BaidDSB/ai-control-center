@@ -498,7 +498,7 @@ pub(crate) fn render_setup_card(
                     });
                     ui.horizontal(|ui| {
                         ui.label("Host/IP:");
-                        if pasteable_singleline(ui, &mut cfg.secondary_node.host, 155.0, "192.168.x.x").lost_focus() {
+                        if pasteable_singleline(ui, &mut cfg.secondary_node.host, 155.0, "10.0.0.20").lost_focus() {
                             sn_dirty = true;
                             drafts.rpc_test_status = None;
                         }

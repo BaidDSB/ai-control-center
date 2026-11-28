@@ -46,6 +46,25 @@ pub fn split_cli_tokens(raw: &str) -> Vec<String> {
     out
 }
 
+fn strip_model_prefix(raw: &str, models_dir: &str) -> String {
+    let trimmed = raw.trim();
+    for prefix in ["__MODELS__\\", "__MODELS__/"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    let mdir = models_dir.trim().trim_end_matches(['\\', '/']);
+    if !mdir.is_empty()
+        && let Some(rest) = trimmed.strip_prefix(mdir)
+    {
+        let rest = rest.trim_start_matches(['\\', '/']);
+        if !rest.is_empty() {
+            return rest.to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 impl ModelSpec {
     pub fn effective_spec_type(&self) -> &str {
         let s = self.spec_type.trim();
@@ -468,29 +487,51 @@ impl ModelProfile {
         let mut out = Vec::new();
         let mut cur = String::new();
         let mut quote: Option<char> = None;
-        for ch in raw.chars() {
+        let mut chars = raw.chars().peekable();
+        while let Some(ch) = chars.next() {
             if let Some(q) = quote {
-                if ch == q { quote = None; } else { cur.push(ch); }
+                if q == '"' && ch == '\\' && chars.peek() == Some(&'"') {
+                    chars.next();
+                    cur.push('"');
+                } else if ch == q {
+                    quote = None;
+                } else {
+                    cur.push(ch);
+                }
             } else {
                 match ch {
                     '"' | '\'' => quote = Some(ch),
                     c if c.is_whitespace() => {
-                        if !cur.is_empty() { out.push(std::mem::take(&mut cur)); }
+                        if !cur.is_empty() {
+                            out.push(std::mem::take(&mut cur));
+                        }
                     }
                     c => cur.push(c),
                 }
             }
         }
-        if !cur.is_empty() { out.push(cur); }
+        if !cur.is_empty() {
+            out.push(cur);
+        }
         out
     }
 
     pub fn build_manual_args_with_port(&self, models_dir: &str, host: &str, port_token: &str) -> Vec<String> {
+        self.build_manual_args_with_port_and_rpc(models_dir, host, port_token, self.single.legacy_rpc_opt())
+    }
+
+    pub fn build_manual_args_with_port_and_rpc(
+        &self,
+        models_dir: &str,
+        host: &str,
+        port_token: &str,
+        resolved_rpc: Option<&str>,
+    ) -> Vec<String> {
         let full_model = Path::new(models_dir).join(&self.single.model_rel_path).to_string_lossy().to_string();
         let ctx_s = self.single.ctx_size.to_string();
         let host_s = host.trim();
         let addr_s = format!("{host_s}:{port_token}");
-        let mut args: Vec<String> = Self::split_quoted_args(&self.manual_flags)
+        let raw_args: Vec<String> = Self::split_quoted_args(&self.manual_flags)
             .into_iter()
             .map(|tok| {
                 tok.replace("{model}", &full_model)
@@ -500,6 +541,32 @@ impl ModelProfile {
                     .replace("{addr}", &addr_s)
             })
             .collect();
+
+        let resolved_ep = resolved_rpc.map(str::trim).filter(|s| !s.is_empty());
+        let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
+        let mut i = 0;
+        while i < raw_args.len() {
+            if raw_args[i] == "--rpc" && i + 1 < raw_args.len() {
+                if let Some(ep) = resolved_ep {
+                    args.push("--rpc".to_string());
+                    args.push(ep.to_string());
+                } else if !self.single.use_rpc {
+                    args.push(raw_args[i].clone());
+                    args.push(raw_args[i + 1].clone());
+                }
+                i += 2;
+            } else if raw_args[i].starts_with("--rpc=") {
+                if let Some(ep) = resolved_ep {
+                    args.push(format!("--rpc={ep}"));
+                } else if !self.single.use_rpc {
+                    args.push(raw_args[i].clone());
+                }
+                i += 1;
+            } else {
+                args.push(raw_args[i].clone());
+                i += 1;
+            }
+        }
 
         if self.single.use_custom_sampling && !args.iter().any(|a| a == "--temp") {
             args.extend([
@@ -526,18 +593,794 @@ impl ModelProfile {
     }
 
     pub fn generate_manual_template(&self) -> String {
+        self.generate_manual_template_with_rpc(self.single.legacy_rpc_opt())
+    }
+
+    pub fn generate_manual_template_with_rpc(&self, resolved_rpc: Option<&str>) -> String {
         if self.effective_engine_kind() == "custom" {
             return self.single.extra_args.clone();
         }
-        let mut args = self.single.build_cli_args_with_port("__MODELS__", &self.host, "{port}");
+        let mut args =
+            self.single
+                .build_cli_args_with_port_and_rpc("__MODELS__", &self.host, "{port}", resolved_rpc);
         let mut i = 0;
         while i + 1 < args.len() {
-            if args[i] == "-m" { args[i + 1] = "{model}".to_string(); }
-            else if args[i] == "-c" { args[i + 1] = "{ctx}".to_string(); }
-            else if args[i] == "--host" { args[i + 1] = "{host}".to_string(); }
+            if args[i] == "-m" {
+                args[i + 1] = "{model}".to_string();
+            } else if args[i] == "-c" {
+                args[i + 1] = "{ctx}".to_string();
+            } else if args[i] == "--host" {
+                args[i + 1] = "{host}".to_string();
+            }
             i += 1;
         }
         args.into_iter().map(|a| quote_for_swap(&a)).collect::<Vec<_>>().join(" ")
+    }
+
+    pub fn sync_simple_from_manual_flags(&mut self, models_dir: &str) {
+        if self.effective_engine_kind() == "custom" {
+            self.single.extra_args = self.manual_flags.clone();
+            return;
+        }
+
+        let tokens = Self::split_quoted_args(&self.manual_flags);
+        let prev_reasoning_family = self.single.reasoning_family.clone();
+
+        // Reset optional/toggleable Simple Mode fields so removed flags turn off cleanly.
+        self.single.use_alias = false;
+        self.single.threads_batch = 0;
+        self.single.no_kv_offload = false;
+        self.single.kv_unified = false;
+        self.single.swa_full = false;
+        self.single.ctx_checkpoints = 0;
+        self.single.load_mode = "auto".to_string();
+        self.single.fit_mode = "default".to_string();
+        self.single.fit_target_mib = 1024;
+        self.single.jinja = false;
+        self.single.moe_enabled = false;
+        self.single.all_moe_cpu = false;
+        self.single.moe_cache_mib = 0;
+        self.single.moe_cache_cpu_share = 0.0;
+        self.single.n_cpu_ffn = 0;
+        self.single.reasoning_preserve = false;
+        self.single.mtp_draft_p_min = 0.0;
+        self.single.mtp_draft_model_rel.clear();
+        self.single.use_rpc = false;
+        self.single.enable_metrics = false;
+        self.single.verbosity = -1;
+        self.single.server_timeout = 0;
+
+        let mut saw_reasoning_mode = false;
+        let mut parsed_reasoning_format: Option<String> = None;
+        let mut parsed_reasoning_preserve = false;
+        let mut parsed_spec_type: Option<String> = None;
+        let mut parsed_model_draft: Option<String> = None;
+        let mut parsed_cache_ram: Option<i32> = None;
+
+        let mut saw_sampler = false;
+        let mut saw_presence = false;
+        let mut saw_repeat = false;
+        let mut saw_dry_mult = false;
+
+        let mut extra_tokens: Vec<String> = Vec::new();
+        let mut i = 0;
+
+        while i < tokens.len() {
+            let tok = &tokens[i];
+            let (flag_name, inline_val): (&str, Option<&str>) = if tok.starts_with('-') {
+                if let Some((k, v)) = tok.split_once('=') {
+                    (k, Some(v))
+                } else {
+                    (tok.as_str(), None)
+                }
+            } else {
+                (tok.as_str(), None)
+            };
+
+            let val_opt: Option<(String, usize)> = if let Some(v) = inline_val {
+                Some((v.to_string(), 1))
+            } else if i + 1 < tokens.len() {
+                Some((tokens[i + 1].clone(), 2))
+            } else {
+                None
+            };
+
+            match flag_name {
+                "-m" | "--model" => {
+                    if let Some((val, step)) = val_opt {
+                        if val != "{model}" && !val.trim().is_empty() {
+                            self.single.model_rel_path = strip_model_prefix(&val, models_dir);
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--alias" | "-a" => {
+                    if let Some((val, step)) = val_opt {
+                        self.single.use_alias = true;
+                        self.single.alias = val;
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-c" | "--ctx-size" => {
+                    if let Some((val, step)) = val_opt {
+                        if val != "{ctx}"
+                            && let Ok(n) = val.parse::<u32>()
+                            && n >= 512
+                        {
+                            self.single.ctx_size = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-b" | "--batch-size" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>()
+                            && n > 0
+                        {
+                            self.single.batch_size = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-ub" | "--ubatch-size" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>()
+                            && n > 0
+                        {
+                            self.single.ubatch_size = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-ngl" | "--n-gpu-layers" | "--gpu-layers" => {
+                    if let Some((val, step)) = val_opt {
+                        if val.eq_ignore_ascii_case("auto") {
+                            self.single.ngl_mode = "auto".to_string();
+                        } else if val.eq_ignore_ascii_case("all") {
+                            self.single.ngl_mode = "custom".to_string();
+                            self.single.ngl_layers = 999;
+                        } else if let Ok(n) = val.parse::<i32>() {
+                            self.single.ngl_mode = "custom".to_string();
+                            self.single.ngl_layers = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-t" | "--threads" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>()
+                            && n > 0
+                        {
+                            self.single.threads = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-tb" | "--threads-batch" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.threads_batch = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-fa" | "--flash-attn" => {
+                    if let Some(v) = inline_val {
+                        match v.to_ascii_lowercase().as_str() {
+                            "on" | "1" | "true" => self.single.flash_attn = "on".to_string(),
+                            "off" | "0" | "false" => self.single.flash_attn = "off".to_string(),
+                            "auto" => self.single.flash_attn = "auto".to_string(),
+                            _ => extra_tokens.push(tok.clone()),
+                        }
+                        i += 1;
+                    } else if i + 1 < tokens.len()
+                        && matches!(
+                            tokens[i + 1].to_ascii_lowercase().as_str(),
+                            "on" | "off" | "auto" | "1" | "0"
+                        )
+                    {
+                        match tokens[i + 1].to_ascii_lowercase().as_str() {
+                            "on" | "1" => self.single.flash_attn = "on".to_string(),
+                            "off" | "0" => self.single.flash_attn = "off".to_string(),
+                            _ => self.single.flash_attn = "auto".to_string(),
+                        }
+                        i += 2;
+                    } else {
+                        self.single.flash_attn = "on".to_string();
+                        i += 1;
+                    }
+                }
+                "-ctk" | "--cache-type-k" => {
+                    if let Some((val, step)) = val_opt {
+                        self.single.cache_type_k = val;
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-ctv" | "--cache-type-v" => {
+                    if let Some((val, step)) = val_opt {
+                        self.single.cache_type_v = val;
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--parallel" | "-np" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>()
+                            && n > 0
+                        {
+                            self.single.parallel_slots = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-nkvo" | "--no-kv-offload" => {
+                    self.single.no_kv_offload = true;
+                    i += 1;
+                }
+                "-kvu" | "--kv-unified" => {
+                    self.single.kv_unified = true;
+                    i += 1;
+                }
+                "--swa-full" => {
+                    self.single.swa_full = true;
+                    i += 1;
+                }
+                "--ctx-checkpoints" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.ctx_checkpoints = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-lm" | "--load-mode" => {
+                    if let Some((val, step)) = val_opt {
+                        self.single.load_mode = val;
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-fit" | "--fit" => {
+                    if let Some((val, step)) = val_opt {
+                        let lower = val.to_ascii_lowercase();
+                        if matches!(lower.as_str(), "on" | "off" | "default") {
+                            self.single.fit_mode = lower;
+                        } else {
+                            extra_tokens.push(tok.clone());
+                            if step == 2 {
+                                extra_tokens.push(val);
+                            }
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--fit-target" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.fit_target_mib = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--jinja" => {
+                    self.single.jinja = true;
+                    i += 1;
+                }
+                "-cmoe" | "--cpu-moe" => {
+                    self.single.moe_enabled = true;
+                    self.single.all_moe_cpu = true;
+                    i += 1;
+                }
+                "--n-cpu-moe" | "-ncmoe" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.moe_enabled = true;
+                            self.single.all_moe_cpu = false;
+                            self.single.n_cpu_moe = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--moe-cache-mib" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.moe_enabled = true;
+                            self.single.moe_cache_mib = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--moe-cache-cpu-share" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            self.single.moe_enabled = true;
+                            self.single.moe_cache_cpu_share = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "-ncffn" | "--n-cpu-ffn" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.n_cpu_ffn = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--chat-template-kwargs" => {
+                    if let Some((val, step)) = val_opt {
+                        let compact: String = val.chars().filter(|c| !c.is_whitespace()).collect();
+                        match compact.as_str() {
+                            r#"{"reasoning_effort":"xhigh"}"# | "{reasoning_effort:xhigh}" => {
+                                self.single.reasoning_family = "effort3".to_string();
+                                self.single.reasoning_mode = "xhigh".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            r#"{"reasoning_effort":"medium"}"# | "{reasoning_effort:medium}" => {
+                                self.single.reasoning_family = "effort3".to_string();
+                                self.single.reasoning_mode = "medium".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            r#"{"reasoning_effort":"low"}"# | "{reasoning_effort:low}" => {
+                                self.single.reasoning_family = "effort3".to_string();
+                                self.single.reasoning_mode = "low".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            r#"{"enable_thinking":true}"# | "{enable_thinking:true}" => {
+                                self.single.reasoning_family = "binary".to_string();
+                                self.single.reasoning_mode = "on".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            r#"{"enable_thinking":false}"# | "{enable_thinking:false}" => {
+                                self.single.reasoning_family = if prev_reasoning_family == "effort3" {
+                                    "effort3".to_string()
+                                } else {
+                                    "binary".to_string()
+                                };
+                                self.single.reasoning_mode = "off".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            _ => {
+                                extra_tokens.push(tok.clone());
+                                if step == 2 {
+                                    extra_tokens.push(val);
+                                }
+                            }
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--reasoning" => {
+                    if let Some((val, step)) = val_opt {
+                        match val.to_ascii_lowercase().as_str() {
+                            "off" => {
+                                self.single.reasoning_family = if prev_reasoning_family == "effort3" {
+                                    "effort3".to_string()
+                                } else {
+                                    "binary".to_string()
+                                };
+                                self.single.reasoning_mode = "off".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            "on" => {
+                                self.single.reasoning_family = "binary".to_string();
+                                self.single.reasoning_mode = "on".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                            _ => {
+                                extra_tokens.push(tok.clone());
+                                if step == 2 {
+                                    extra_tokens.push(val);
+                                }
+                            }
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--reasoning-budget" => {
+                    if let Some((val, step)) = val_opt {
+                        if val.trim() == "0" {
+                            if !saw_reasoning_mode {
+                                self.single.reasoning_family = if prev_reasoning_family == "effort3" {
+                                    "effort3".to_string()
+                                } else {
+                                    "binary".to_string()
+                                };
+                                self.single.reasoning_mode = "off".to_string();
+                                saw_reasoning_mode = true;
+                            }
+                        } else {
+                            extra_tokens.push(tok.clone());
+                            if step == 2 {
+                                extra_tokens.push(val);
+                            }
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--reasoning-format" => {
+                    if let Some((val, step)) = val_opt {
+                        parsed_reasoning_format = Some(val);
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--reasoning-preserve" => {
+                    parsed_reasoning_preserve = true;
+                    i += 1;
+                }
+                "--spec-type" => {
+                    if let Some((val, step)) = val_opt {
+                        parsed_spec_type = Some(val);
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--spec-draft-n-max" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.mtp_draft_max = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--spec-draft-p-min" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            self.single.mtp_draft_p_min = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--model-draft" | "-md" => {
+                    if let Some((val, step)) = val_opt {
+                        parsed_model_draft = Some(val);
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--temp" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            self.single.temp = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--min-p" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            self.single.min_p = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--top-p" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            self.single.top_p = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--top-k" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<i32>() {
+                            saw_sampler = true;
+                            self.single.top_k = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--presence-penalty" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            saw_presence = true;
+                            self.single.presence_penalty = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--repeat-penalty" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            saw_repeat = true;
+                            self.single.repeat_penalty = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--dry-multiplier" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            saw_dry_mult = true;
+                            self.single.dry_multiplier = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--dry-base" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(f) = val.parse::<f32>() {
+                            saw_sampler = true;
+                            self.single.dry_base = f;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--dry-allowed-length" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            saw_sampler = true;
+                            self.single.dry_allowed_length = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--rpc" => {
+                    if let Some((val, step)) = val_opt {
+                        self.single.use_rpc = true;
+                        if !val.trim().is_empty() {
+                            self.single.rpc_endpoint = val;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--cache-ram" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<i32>() {
+                            parsed_cache_ram = Some(n);
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--metrics" => {
+                    self.single.enable_metrics = true;
+                    i += 1;
+                }
+                "-lv" | "--log-verbosity" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<i32>() {
+                            self.single.verbosity = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--timeout" | "-to" => {
+                    if let Some((val, step)) = val_opt {
+                        if let Ok(n) = val.parse::<u32>() {
+                            self.single.server_timeout = n;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--host" => {
+                    if let Some((val, step)) = val_opt {
+                        if val != "{host}" && !val.trim().is_empty() {
+                            self.host = val;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                "--port" => {
+                    if let Some((val, step)) = val_opt {
+                        if val != "{port}"
+                            && let Ok(p) = val.parse::<u16>()
+                            && p >= 1024
+                        {
+                            self.port = p;
+                        }
+                        i += step;
+                    } else {
+                        extra_tokens.push(tok.clone());
+                        i += 1;
+                    }
+                }
+                _ => {
+                    extra_tokens.push(tok.clone());
+                    i += 1;
+                }
+            }
+        }
+
+        // Finalize reasoning fields without dropping standalone flags.
+        if saw_reasoning_mode {
+            if self.single.reasoning_mode != "off" {
+                self.single.reasoning_format =
+                    parsed_reasoning_format.unwrap_or_else(|| "default".to_string());
+                self.single.reasoning_preserve = parsed_reasoning_preserve;
+            } else {
+                if let Some(fmt) = parsed_reasoning_format {
+                    extra_tokens.push("--reasoning-format".to_string());
+                    extra_tokens.push(fmt);
+                }
+                if parsed_reasoning_preserve {
+                    extra_tokens.push("--reasoning-preserve".to_string());
+                }
+            }
+        } else {
+            self.single.reasoning_family = "none".to_string();
+            self.single.reasoning_mode = "off".to_string();
+            if let Some(fmt) = parsed_reasoning_format {
+                extra_tokens.push("--reasoning-format".to_string());
+                extra_tokens.push(fmt);
+            }
+            if parsed_reasoning_preserve {
+                extra_tokens.push("--reasoning-preserve".to_string());
+            }
+        }
+
+        // Finalize speculative decoding / MTP fields.
+        if let Some(st) = parsed_spec_type {
+            self.single.set_spec_type(&st);
+            if let Some(md) = parsed_model_draft {
+                if st == "draft-mtp" {
+                    self.single.mtp_draft_model_rel = strip_model_prefix(&md, models_dir);
+                } else {
+                    extra_tokens.push("--model-draft".to_string());
+                    extra_tokens.push(md);
+                }
+            }
+        } else {
+            self.single.set_spec_type("off");
+            self.single.mtp_draft_p_min = 0.0;
+            self.single.mtp_draft_model_rel.clear();
+            if let Some(md) = parsed_model_draft {
+                extra_tokens.push("--model-draft".to_string());
+                extra_tokens.push(md);
+            }
+        }
+
+        // Finalize custom samplers.
+        self.single.use_custom_sampling = saw_sampler;
+        if saw_sampler {
+            if !saw_presence {
+                self.single.presence_penalty = 0.0;
+            }
+            if !saw_repeat {
+                self.single.repeat_penalty = 1.0;
+            }
+            if !saw_dry_mult {
+                self.single.dry_multiplier = 0.0;
+            }
+        }
+
+        // Finalize cache-ram (treat --cache-ram 0 alongside --rpc as RPC's auto default).
+        self.single.cache_ram_mib = match parsed_cache_ram {
+            Some(0) if self.single.use_rpc => -1,
+            Some(n) => n,
+            None => -1,
+        };
+
+        self.single.extra_args = extra_tokens
+            .into_iter()
+            .map(|t| quote_for_swap(&t))
+            .collect::<Vec<_>>()
+            .join(" ");
     }
 
     pub fn build_args_with_port(&self, models_dir: &str, port_token: &str) -> Vec<String> {
@@ -551,7 +1394,7 @@ impl ModelProfile {
         resolved_rpc: Option<&str>,
     ) -> Vec<String> {
         if self.use_manual_flags && !self.manual_flags.trim().is_empty() {
-            self.build_manual_args_with_port(models_dir, &self.host, port_token)
+            self.build_manual_args_with_port_and_rpc(models_dir, &self.host, port_token, resolved_rpc)
         } else if self.effective_engine_kind() == "custom" {
             {
                 let full_model = Path::new(models_dir).join(&self.single.model_rel_path).to_string_lossy().to_string();

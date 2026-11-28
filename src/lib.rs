@@ -33,7 +33,9 @@ impl AppPatch {
     }
 
     pub fn effective_version(&self) -> &str {
-        self.version_label.as_deref().unwrap_or("v1.0")
+        self.version_label
+            .as_deref()
+            .unwrap_or(concat!("v", env!("CARGO_PKG_VERSION")))
     }
 
     pub fn effective_hardware_label(&self) -> &str {

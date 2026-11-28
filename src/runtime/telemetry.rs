@@ -117,22 +117,33 @@ pub fn http_local_request(
     let _ = stream.set_read_timeout(Some(timeout));
     let _ = stream.set_write_timeout(Some(timeout));
 
+    let extra_hdr = if method.eq_ignore_ascii_case("POST") || method.eq_ignore_ascii_case("PUT") {
+        "Content-Length: 0\r\n"
+    } else {
+        ""
+    };
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {probe_host}:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {probe_host}:{port}\r\nAccept: */*\r\n{extra_hdr}Connection: close\r\n\r\n"
     );
     stream
         .write_all(req.as_bytes())
         .map_err(|e| format!("HTTP write failed: {e}"))?;
 
     let mut buf = Vec::new();
-    let _ = stream.take(262_144).read_to_end(&mut buf);
+    let read_res = stream.take(262_144).read_to_end(&mut buf);
+    if buf.is_empty() {
+        return match read_res {
+            Err(e) => Err(format!("HTTP read failed ({method} {path}): {e}")),
+            Ok(_) => Err(format!("Empty HTTP response ({method} {path})")),
+        };
+    }
     let raw = String::from_utf8_lossy(&buf);
     let (hdr_part, body_part) = if let Some((h, b)) = raw.split_once("\r\n\r\n") {
         (h, b)
     } else if let Some((h, b)) = raw.split_once("\n\n") {
         (h, b)
     } else {
-        return Err("Malformed HTTP response".to_string());
+        return Err(format!("Malformed HTTP response ({method} {path})"));
     };
 
     let status_line = hdr_part.lines().next().unwrap_or("");
@@ -289,18 +300,28 @@ pub fn poll_llama_swap_running(host: &str, port: u16) -> Option<Vec<RunningModel
 }
 
 pub fn soft_unload_llama_swap(host: &str, port: u16) -> Result<(), String> {
-    let (status, body) = http_local_request(host, port, "GET", "/unload", 1500)?;
+    let (status, body) = http_local_request(host, port, "POST", "/api/models/unload", 10_000)?;
     if (200..300).contains(&status) {
         return Ok(());
     }
-    if status == 405 {
-        let (st2, body2) = http_local_request(host, port, "POST", "/unload", 1500)?;
+    if status == 404 || status == 405 {
+        let (st2, body2) = http_local_request(host, port, "GET", "/unload", 10_000)?;
         if (200..300).contains(&st2) {
             return Ok(());
         }
-        return Err(format!("POST /unload returned HTTP {st2}: {}", body2.trim()));
+        if st2 == 405 {
+            let (st3, body3) = http_local_request(host, port, "POST", "/unload", 10_000)?;
+            if (200..300).contains(&st3) {
+                return Ok(());
+            }
+            return Err(format!("POST /unload returned HTTP {st3}: {}", body3.trim()));
+        }
+        return Err(format!("GET /unload returned HTTP {st2}: {}", body2.trim()));
     }
-    Err(format!("GET /unload returned HTTP {status}: {}", body.trim()))
+    Err(format!(
+        "POST /api/models/unload returned HTTP {status}: {}",
+        body.trim()
+    ))
 }
 
 pub fn llama_swap_ui_url(host: &str, port: u16) -> String {
@@ -413,7 +434,7 @@ fn probe_windows_pdh_gpu_memory_mib(hint_dedicated_mib: Option<u64>) -> Option<(
     type PdhHQuery = *mut c_void;
     type PdhHCounter = *mut c_void;
 
-    const PDH_FMT_LARGE: u32 = 0x0000_0200;
+    const PDH_FMT_LARGE: u32 = 0x0000_0400;
     const PDH_MORE_DATA: u32 = 0x8000_07D2;
 
     #[repr(C)]

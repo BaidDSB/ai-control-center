@@ -278,7 +278,7 @@ pub(crate) fn render_left_workspace(
                                             peer_dirty = true;
                                         }
                                         ui.label("Proxy:");
-                                        if pasteable_singleline(ui, &mut peer.proxy, 165.0, "http://192.168.x.x:8080").lost_focus() {
+                                        if pasteable_singleline(ui, &mut peer.proxy, 165.0, "http://10.0.0.20:8080").lost_focus() {
                                             peer_dirty = true;
                                         }
                                         if ui.small_button("X").on_hover_text("Remove peer").clicked() {
@@ -313,7 +313,7 @@ pub(crate) fn render_left_workspace(
                                         s_mut.peers.push(SwapPeer {
                                             enabled: true,
                                             name: format!("peer-{n}"),
-                                            proxy: "http://192.168.0.245:8080".to_string(),
+                                            proxy: "http://10.0.0.20:8080".to_string(),
                                             api_key: String::new(),
                                             models: Vec::new(),
                                         });

@@ -40,7 +40,7 @@ mod tests {
         prof.single.model_rel_path = "test-model.gguf".to_string();
         prof.single.ctx_size = 32768;
 
-        let args = prof.build_args_with_port("D:\\Models", "${PORT}");
+        let args = prof.build_args_with_port("C:\\Models", "${PORT}");
         assert!(args.iter().any(|a| a == "${PORT}"));
         assert!(args.iter().any(|a| a == "32768"));
         assert!(args.iter().any(|a| a.contains("My Templates")));
@@ -51,14 +51,14 @@ mod tests {
         let saved = ModelProfile::default();
         let mut current = saved.clone();
 
-        let clean = compute_cli_diff(&current, &saved, "D:\\Models");
+        let clean = compute_cli_diff(&current, &saved, "C:\\Models");
         assert_eq!(clean.change_count, 0);
         assert!(clean.removed.is_empty());
 
         current.single.ctx_size = saved.single.ctx_size + 8192;
         current.single.disable_cuda_pinned = true;
         current.use_manual_flags = true;
-        let changed = compute_cli_diff(&current, &saved, "D:\\Models");
+        let changed = compute_cli_diff(&current, &saved, "C:\\Models");
         assert!(changed.change_count >= 2);
         assert_eq!(changed.env_pinned, Some(DiffKind::Added));
     }
@@ -178,7 +178,7 @@ mod tests {
     fn secondary_node_resolves_auto_and_strict_rpc_fallback() {
         let mut cfg = StackConfig::default();
         cfg.secondary_node.enabled = true;
-        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.host = "10.0.0.20".to_string();
         cfg.secondary_node.rpc_port = 50052;
         cfg.secondary_node.rpc_fallback = RpcFallbackPolicy::Auto;
 
@@ -188,33 +188,33 @@ mod tests {
 
         // Auto + reachable -> uses centralized endpoint and forces --cache-ram 0
         let ep_ok = cfg.effective_rpc_for_profile(&prof.single, Some(true));
-        assert_eq!(ep_ok.as_deref(), Some("192.168.0.245:50052"));
-        let args_ok = prof.build_llama_args_with_rpc("D:\\Models", ep_ok.as_deref());
-        assert!(args_ok.windows(2).any(|w| w == ["--rpc", "192.168.0.245:50052"]));
+        assert_eq!(ep_ok.as_deref(), Some("10.0.0.20:50052"));
+        let args_ok = prof.build_llama_args_with_rpc("C:\\Models", ep_ok.as_deref());
+        assert!(args_ok.windows(2).any(|w| w == ["--rpc", "10.0.0.20:50052"]));
         assert!(args_ok.windows(2).any(|w| w == ["--cache-ram", "0"]));
 
         // Auto + unreachable -> omits --rpc and restores profile --cache-ram
         let ep_down = cfg.effective_rpc_for_profile(&prof.single, Some(false));
         assert_eq!(ep_down, None);
-        let args_down = prof.build_llama_args_with_rpc("D:\\Models", ep_down.as_deref());
+        let args_down = prof.build_llama_args_with_rpc("C:\\Models", ep_down.as_deref());
         assert!(!args_down.iter().any(|a| a == "--rpc"));
         assert!(args_down.windows(2).any(|w| w == ["--cache-ram", "1024"]));
 
         // Strict + unreachable -> still emits --rpc
         cfg.secondary_node.rpc_fallback = RpcFallbackPolicy::Strict;
         let ep_strict = cfg.effective_rpc_for_profile(&prof.single, Some(false));
-        assert_eq!(ep_strict.as_deref(), Some("192.168.0.245:50052"));
+        assert_eq!(ep_strict.as_deref(), Some("10.0.0.20:50052"));
     }
 
     #[test]
     fn legacy_profile_rpc_migrates_to_secondary_node() {
         let mut cfg = StackConfig::default();
         cfg.groups[0].profiles[0].single.use_rpc = true;
-        cfg.groups[0].profiles[0].single.rpc_endpoint = "192.168.0.245:50052".to_string();
+        cfg.groups[0].profiles[0].single.rpc_endpoint = "10.0.0.20:50052".to_string();
         cfg.migrate_legacy_rpc_to_secondary_node();
 
         assert!(cfg.secondary_node.enabled);
-        assert_eq!(cfg.secondary_node.host, "192.168.0.245");
+        assert_eq!(cfg.secondary_node.host, "10.0.0.20");
         assert_eq!(cfg.secondary_node.rpc_port, 50052);
         assert_eq!(cfg.secondary_node.rpc_fallback, RpcFallbackPolicy::Auto);
     }
@@ -223,7 +223,7 @@ mod tests {
     fn routing_set_yaml_honors_auto_rpc_fallback() {
         let mut cfg = StackConfig::default();
         cfg.secondary_node.enabled = true;
-        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.host = "10.0.0.20".to_string();
         cfg.secondary_node.rpc_port = 50052;
         cfg.secondary_node.rpc_fallback = RpcFallbackPolicy::Auto;
         cfg.groups[0].profiles[0].single.use_rpc = true;
@@ -232,7 +232,7 @@ mod tests {
         let yaml_up = cfg.build_routing_set_yaml_with_rpc_status(&set, Some(true));
         let yaml_down = cfg.build_routing_set_yaml_with_rpc_status(&set, Some(false));
 
-        assert!(yaml_up.contains("--rpc 192.168.0.245:50052 --cache-ram 0"));
+        assert!(yaml_up.contains("--rpc 10.0.0.20:50052 --cache-ram 0"));
         assert!(!yaml_down.contains("--rpc"));
     }
 
@@ -260,14 +260,14 @@ mod tests {
         set.peers.push(SwapPeer {
             enabled: true,
             name: "laptop-peer".to_string(),
-            proxy: "http://192.168.0.245:8080".to_string(),
+            proxy: "http://10.0.0.20:8080".to_string(),
             api_key: "secret-key".to_string(),
             models: vec!["qwen3.5-4b".to_string()],
         });
         set.peers.push(SwapPeer {
             enabled: false,
             name: "disabled-peer".to_string(),
-            proxy: "http://192.168.0.250:8080".to_string(),
+            proxy: "http://10.0.0.25:8080".to_string(),
             api_key: String::new(),
             models: vec!["ignored".to_string()],
         });
@@ -276,7 +276,7 @@ mod tests {
         assert!(yaml.contains("checkEndpoint: \"/v1/models\""));
         assert!(yaml.contains("checkEndpoint: \"none\""));
         assert!(yaml.contains("groups:\n  \"always-on\":\n    swap: false\n    exclusive: false\n    persistent: true\n    members:\n      - \"local-model\"\n      - \"bge-embed\""));
-        assert!(yaml.contains("peers:\n  \"laptop-peer\":\n    proxy: \"http://192.168.0.245:8080\"\n    apiKey: \"secret-key\"\n    models:\n      - \"qwen3.5-4b\""));
+        assert!(yaml.contains("peers:\n  \"laptop-peer\":\n    proxy: \"http://10.0.0.20:8080\"\n    apiKey: \"secret-key\"\n    models:\n      - \"qwen3.5-4b\""));
         assert!(!yaml.contains("disabled-peer"));
     }
 
@@ -284,7 +284,7 @@ mod tests {
     fn detect_rpc_peer_collisions_flags_same_host_only() {
         let mut cfg = StackConfig::default();
         cfg.secondary_node.enabled = true;
-        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.host = "10.0.0.20".to_string();
         cfg.secondary_node.rpc_port = 50052;
         cfg.groups[0].profiles[0].single.use_rpc = true;
 
@@ -292,28 +292,28 @@ mod tests {
         set.peers.push(SwapPeer {
             enabled: true,
             name: "laptop-same".to_string(),
-            proxy: "http://192.168.0.245:8080/v1".to_string(),
+            proxy: "http://10.0.0.20:8080/v1".to_string(),
             api_key: String::new(),
             models: vec!["qwen3.5-4b".to_string()],
         });
         set.peers.push(SwapPeer {
             enabled: true,
             name: "other-box".to_string(),
-            proxy: "http://192.168.0.246:8080".to_string(),
+            proxy: "http://10.0.0.21:8080".to_string(),
             api_key: String::new(),
             models: vec!["other".to_string()],
         });
 
         let collisions = cfg.detect_rpc_peer_collisions(&set);
         assert_eq!(collisions.len(), 1);
-        assert!(collisions[0].contains("192.168.0.245"));
+        assert!(collisions[0].contains("10.0.0.20"));
         assert!(collisions[0].contains("laptop-same"));
     }
 
     #[test]
     fn extract_normalized_host_handles_urls_and_ipv6() {
-        assert_eq!(extract_normalized_host("192.168.0.245:50052").as_deref(), Some("192.168.0.245"));
-        assert_eq!(extract_normalized_host("http://192.168.0.245:8080/v1").as_deref(), Some("192.168.0.245"));
+        assert_eq!(extract_normalized_host("10.0.0.20:50052").as_deref(), Some("10.0.0.20"));
+        assert_eq!(extract_normalized_host("http://10.0.0.20:8080/v1").as_deref(), Some("10.0.0.20"));
         assert_eq!(extract_normalized_host("https://OpenRouter.ai/api").as_deref(), Some("openrouter.ai"));
         assert_eq!(extract_normalized_host("http://[::1]:8080/").as_deref(), Some("::1"));
         assert_eq!(extract_normalized_host("   "), None);
@@ -323,7 +323,7 @@ mod tests {
     fn disabled_peer_does_not_trigger_rpc_collision() {
         let mut cfg = StackConfig::default();
         cfg.secondary_node.enabled = true;
-        cfg.secondary_node.host = "192.168.0.245".to_string();
+        cfg.secondary_node.host = "10.0.0.20".to_string();
         cfg.secondary_node.rpc_port = 50052;
         cfg.groups[0].profiles[0].single.use_rpc = true;
 
@@ -331,7 +331,7 @@ mod tests {
         set.peers.push(SwapPeer {
             enabled: false,
             name: "laptop-off".to_string(),
-            proxy: "http://192.168.0.245:8080".to_string(),
+            proxy: "http://10.0.0.20:8080".to_string(),
             api_key: String::new(),
             models: vec![],
         });
@@ -407,15 +407,15 @@ mod tests {
         let mut prof = ModelProfile::default();
         prof.name = "Qwen 35B Fast".to_string();
         prof.engine_label = "llama.cpp".to_string();
-        prof.engine_dir_override = r"D:\Local LLM Setup\Engines\llama-b5000".to_string();
+        prof.engine_dir_override = r"C:\AI-Lab\Engines\llama-b5000".to_string();
         prof.single.model_rel_path = r"Qwen3\Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf".to_string();
         prof.single.mtp_draft_model_rel = r"Drafts\Qwen3-0.6B.gguf".to_string();
-        prof.single.rpc_endpoint = "192.168.0.245:50052".to_string();
+        prof.single.rpc_endpoint = "10.0.0.20:50052".to_string();
         prof.single.ctx_size = 131072;
 
         let exported = prof.to_portable_toml().expect("export portable toml");
-        assert!(!exported.contains(r"D:\Local LLM Setup"));
-        assert!(!exported.contains("192.168.0.245"));
+        assert!(!exported.contains(r"C:\AI-Lab"));
+        assert!(!exported.contains("10.0.0.20"));
         assert!(exported.contains("Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"));
 
         let scanned = vec![
@@ -462,5 +462,113 @@ mod tests {
         assert!(crate::ui::theme::valid_dialog_dir("Z:\\definitely_missing_dir_99999").is_none());
         let tmp = std::env::temp_dir();
         assert!(crate::ui::theme::valid_dialog_dir(&tmp.to_string_lossy()).is_some());
+    }
+
+    #[test]
+    fn split_quoted_args_unescapes_json_quotes_and_preserves_windows_paths() {
+        let raw = r#"-m "C:\AI-Lab\Models\qwen.gguf" --chat-template-kwargs "{\"enable_thinking\":false}""#;
+        let toks = ModelProfile::split_quoted_args(raw);
+        assert_eq!(toks[0], "-m");
+        assert_eq!(toks[1], r"C:\AI-Lab\Models\qwen.gguf");
+        assert_eq!(toks[2], "--chat-template-kwargs");
+        assert_eq!(toks[3], r#"{"enable_thinking":false}"#);
+    }
+
+    #[test]
+    fn manual_flags_respect_auto_rpc_strip_and_endpoint_override() {
+        let mut prof = ModelProfile::default();
+        prof.use_manual_flags = true;
+        prof.single.use_rpc = true;
+        prof.manual_flags =
+            r#"-m {model} --rpc 10.0.0.20:50052 --cache-ram 0 --port {port}"#.to_string();
+
+        let offline = prof.build_args_with_port_and_rpc("Models", "${PORT}", None);
+        assert!(!offline.iter().any(|t| t == "--rpc"));
+        assert!(!offline.iter().any(|t| t.contains("10.0.0.20")));
+
+        let online = prof.build_args_with_port_and_rpc("Models", "${PORT}", Some("10.0.0.5:50052"));
+        assert!(online.windows(2).any(|w| w[0] == "--rpc" && w[1] == "10.0.0.5:50052"));
+    }
+
+    #[test]
+    fn two_way_sync_roundtrips_simple_and_extra_args() {
+        let mut src = ModelProfile::default();
+        src.single.alias = "Qwen-27B-RPC".to_string();
+        src.single.ngl_mode = "custom".to_string();
+        src.single.ngl_layers = 999;
+        src.single.batch_size = 1024;
+        src.single.ubatch_size = 512;
+        src.single.threads = 6;
+        src.single.threads_batch = 12;
+        src.single.cache_type_k = "q4_0".to_string();
+        src.single.cache_type_v = "q4_0".to_string();
+        src.single.fit_mode = "off".to_string();
+        src.single.reasoning_family = "effort3".to_string();
+        src.single.reasoning_mode = "medium".to_string();
+        src.single.reasoning_format = "deepseek".to_string();
+        src.single.set_spec_type("draft-mtp");
+        src.single.mtp_draft_max = 2;
+        src.single.mtp_draft_p_min = 0.60;
+        src.single.mtp_draft_model_rel = "mtp-draft.gguf".to_string();
+        src.single.use_custom_sampling = true;
+        src.single.temp = 1.0;
+        src.single.min_p = 0.0;
+        src.single.top_p = 0.95;
+        src.single.top_k = 20;
+        src.single.use_rpc = true;
+        src.single.rpc_endpoint = "10.0.0.5:50052".to_string();
+        src.single.extra_args = "-dev RPC0,CUDA0 -ts 26,74".to_string();
+
+        let emitted = src.generate_manual_template();
+
+        let mut dst = ModelProfile::default();
+        dst.manual_flags = emitted.clone();
+        dst.sync_simple_from_manual_flags("C:\\Models");
+
+        assert_eq!(dst.single.alias, "Qwen-27B-RPC");
+        assert_eq!(dst.single.ngl_layers, 999);
+        assert_eq!(dst.single.threads_batch, 12);
+        assert_eq!(dst.single.cache_type_k, "q4_0");
+        assert_eq!(dst.single.cache_type_v, "q4_0");
+        assert_eq!(dst.single.fit_mode, "off");
+        assert_eq!(dst.single.reasoning_family, "effort3");
+        assert_eq!(dst.single.reasoning_mode, "medium");
+        assert_eq!(dst.single.reasoning_format, "deepseek");
+        assert_eq!(dst.single.effective_spec_type(), "draft-mtp");
+        assert!((dst.single.mtp_draft_p_min - 0.60).abs() < 0.01);
+        assert_eq!(dst.single.mtp_draft_model_rel, "mtp-draft.gguf");
+        assert!(dst.single.use_custom_sampling);
+        assert!(dst.single.use_rpc);
+        assert_eq!(dst.single.rpc_endpoint, "10.0.0.5:50052");
+        assert_eq!(dst.single.extra_args, "-dev RPC0,CUDA0 -ts 26,74");
+        assert_eq!(dst.generate_manual_template(), emitted);
+    }
+
+    #[test]
+    fn two_way_sync_clears_removed_flags_and_keeps_unknowns_in_extra() {
+        let mut prof = ModelProfile::default();
+        prof.single.mtp_draft_model_rel = "old-draft.gguf".to_string();
+        prof.single.presence_penalty = 1.5;
+        prof.single.use_rpc = true;
+        prof.manual_flags = "-m {model} -c 16384 -ngl 999 -fa on -ctk q4_0 -ctv q4_0 --jinja --spec-type draft-mtp --spec-draft-n-max 2 --temp 1.00 --top-p 0.95 --top-k 20 --min-p 0.00 --host {host} --port {port} -dev RPC0,CUDA0 -ts 26,74 --custom-opt 42".to_string();
+
+        prof.sync_simple_from_manual_flags("C:\\Models");
+
+        assert_eq!(prof.single.ctx_size, 16384);
+        assert_eq!(prof.single.ngl_layers, 999);
+        assert!(prof.single.mtp_draft_model_rel.is_empty());
+        assert!(!prof.single.use_rpc);
+        assert!((prof.single.presence_penalty - 0.0).abs() < 0.001);
+        assert_eq!(prof.single.extra_args, "-dev RPC0,CUDA0 -ts 26,74 --custom-opt 42");
+    }
+
+    #[test]
+    fn two_way_sync_preserves_custom_engine_args() {
+        let mut prof = ModelProfile::default();
+        prof.engine_kind = "custom".to_string();
+        prof.manual_flags = "serve {model} --port {port} --vram-mb 7200".to_string();
+        prof.sync_simple_from_manual_flags("C:\\Models");
+        assert_eq!(prof.single.extra_args, prof.manual_flags);
+        assert_eq!(prof.generate_manual_template(), prof.manual_flags);
     }
 }
